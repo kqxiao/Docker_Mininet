@@ -1,0 +1,16 @@
+# 格式: src dst bandwidth(Mbps)
+# 业务流 1
+docker1:h1 docker5:h1 20
+
+# 业务流 2
+docker2:h2 docker3:h3 10
+
+# 业务流 3
+docker1:h2 docker4:h4 15
+
+# 业务流 4
+docker5:h5 docker2:h2 30
+
+# 业务流 5
+docker3:h3 docker4:h3 10
+
