@@ -48,13 +48,37 @@ sudo docker build -t mininet_docker .
 sudo python3 master_deploy.py
 ```
 
-### 2.3 单条业务算路与下发（示例）
+### 2.3 查看可选拓扑预设
+```bash
+# 域间拓扑预设
+python3 master_deploy.py --list-inter-presets
+
+# 域内拓扑预设
+python3 master_deploy.py --list-intra-presets
+```
+
+### 2.4 选择不同拓扑进行建设（示例）
+可用预设：
+
+域间：ba_core / ring5 / star5 / mesh5
+域内：ba_core / ring20 / ws20 / er20 / tree20
+
+```bash
+# 示例1：域间环形 + 域内小世界
+sudo python3 master_deploy.py --inter-preset ring5 --intra-preset ws20
+
+# 示例2：域间全互联 + 域内随机图（连通）
+sudo python3 master_deploy.py --inter-preset mesh5 --intra-preset er20
+```
+
+
+### 2.5 单条业务算路与下发（示例）
 ```bash
 sudo python3 route_cal.py docker2:h1 docker5:h1 20
 sudo python3 route_path.py docker2:h1 docker5:h1 20 --index 0
 ```
 
-### 2.4 批量业务（可选）
+### 2.6 批量业务（可选）
 ```bash
 sudo python3 route_batch.py test_traffic.txt
 ```

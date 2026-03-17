@@ -5,6 +5,7 @@ import subprocess
 import sys
 import time
 import os
+import argparse
 
 # 配置
 DOMAIN_SCRIPT_OUT = "autobuild_out.py"
@@ -72,7 +73,53 @@ def reset_runtime_state():
                     pass
 
 
-def main():
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Build inter/intra domain network with selectable topology presets."
+    )
+    parser.add_argument(
+        "--inter-preset",
+        default="ba_core",
+        help="Inter-domain topology preset passed to autobuild_out.py",
+    )
+    parser.add_argument(
+        "--inter-seed",
+        type=int,
+        default=1,
+        help="Seed for inter-domain topology/QoS generation",
+    )
+    parser.add_argument(
+        "--intra-preset",
+        default="ba_core",
+        help="Intra-domain topology preset passed to autobuild_in_agent.py",
+    )
+    parser.add_argument(
+        "--intra-seed-base",
+        type=int,
+        default=1,
+        help="Base seed for intra-domain generation; docker i uses seed=(base+i-1)",
+    )
+    parser.add_argument(
+        "--list-inter-presets",
+        action="store_true",
+        help="List inter-domain presets and exit",
+    )
+    parser.add_argument(
+        "--list-intra-presets",
+        action="store_true",
+        help="List intra-domain presets and exit",
+    )
+    return parser.parse_args()
+
+
+def main(args):
+    if args.list_inter_presets:
+        run_cmd(f"python3 {DOMAIN_SCRIPT_OUT} --list-presets")
+        return
+    if args.list_intra_presets:
+        run_cmd(f"python3 {DOMAIN_SCRIPT_IN} --list-presets")
+        return
+
     # 0. 清理历史状态
     print("\n" + "=" * 40)
     print("STEP 0: 清理历史状态 (topo_data/topo_path)")
@@ -83,12 +130,16 @@ def main():
     print("\n" + "=" * 40)
     print("STEP 1: 构建域间网络 (Docker + OVS)")
     print("=" * 40)
-    run_cmd(f"sudo python3 {DOMAIN_SCRIPT_OUT}")
+    run_cmd(
+        f"sudo python3 {DOMAIN_SCRIPT_OUT} --preset {args.inter_preset} --seed {args.inter_seed}"
+    )
 
     # 2. 部署域内网络
     print("\n" + "=" * 40)
     print("STEP 2: 部署域内网络 (Mininet inside Docker)")
     print("=" * 40)
+    print(f"Inter preset: {args.inter_preset} (seed={args.inter_seed})")
+    print(f"Intra preset: {args.intra_preset} (seed base={args.intra_seed_base})")
 
     # 准备数据目录
     if not os.path.exists("topo_data"):
@@ -100,7 +151,7 @@ def main():
 
     for i in range(1, NUM_CONTAINERS + 1):
         container_name = f"docker{i}"
-        seed = i
+        seed = args.intra_seed_base + i - 1
 
         print(f"\n[Deploying {container_name}] Seed={seed}, DockerID={i}...")
 
@@ -110,7 +161,10 @@ def main():
         )
 
         # 后台运行 (传入 --id)
-        cmd = f"sudo docker exec -d {container_name} python3 /root/topo_agent.py --seed {seed} --id {i}"
+        cmd = (
+            f"sudo docker exec -d {container_name} python3 /root/topo_agent.py "
+            f"--seed {seed} --id {i} --preset {args.intra_preset}"
+        )
         run_cmd(cmd)
 
         print(f"  -> {container_name} started.")
@@ -161,4 +215,4 @@ if __name__ == "__main__":
     if not os.path.exists(DOMAIN_SCRIPT_IN):
         print(f"错误: 找不到 {DOMAIN_SCRIPT_IN}")
         sys.exit(1)
-    main()
+    main(parse_args())

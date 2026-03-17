@@ -15,8 +15,13 @@ from mininet.log import setLogLevel, info
 import networkx as nx
 
 # ================= 配置区域 =================
-NUM_SWITCHES = 20
-BA_M = 2
+INTRA_PRESETS = {
+    "ba_core": {"desc": "BA(20,2) 默认域内拓扑", "type": "ba", "n": 20, "m": 2},
+    "ring20": {"desc": "20节点环形", "type": "ring", "n": 20},
+    "ws20": {"desc": "WS小世界(20,4,0.25)", "type": "ws", "n": 20, "k": 4, "p": 0.25},
+    "er20": {"desc": "ER随机图(20,0.18,保证连通)", "type": "er", "n": 20, "p": 0.18},
+    "tree20": {"desc": "20节点随机树", "type": "tree", "n": 20},
+}
 # ===========================================
 
 def run_cmd(cmd, ignore_error=False):
@@ -26,6 +31,42 @@ def run_cmd(cmd, ignore_error=False):
         if not ignore_error:
             print(f"Error executing: {cmd}")
             sys.exit(1)
+
+
+def _build_connected_er_graph(n, p, seed):
+    """
+    构建连通 ER 图；若不连通则基于 seed 递增重试。
+    """
+    for offset in range(256):
+        s = seed + offset
+        G = nx.erdos_renyi_graph(n=n, p=p, seed=s)
+        if nx.is_connected(G):
+            return G
+    raise RuntimeError("Failed to build a connected ER graph after 256 attempts.")
+
+
+def build_intra_graph(preset_name, seed):
+    if preset_name not in INTRA_PRESETS:
+        raise ValueError(f"Unknown intra preset: {preset_name}")
+
+    cfg = INTRA_PRESETS[preset_name]
+    n = cfg["n"]
+    t = cfg["type"]
+
+    if t == "ba":
+        return nx.barabasi_albert_graph(n=n, m=cfg["m"], seed=seed)
+    if t == "ring":
+        return nx.cycle_graph(n)
+    if t == "ws":
+        return nx.connected_watts_strogatz_graph(
+            n=n, k=cfg["k"], p=cfg["p"], seed=seed
+        )
+    if t == "er":
+        return _build_connected_er_graph(n=n, p=cfg["p"], seed=seed)
+    if t == "tree":
+        return nx.random_labeled_tree(n=n, seed=seed)
+
+    raise ValueError(f"Unsupported intra topology type: {t}")
 
 
 def get_external_interfaces():
@@ -173,16 +214,23 @@ def save_topology(net, docker_id, external_map, qos_data):
         json.dump(topo_data, f, indent=4)
 
 
-def baSwitchTopo(seed, docker_id):
-    info(f'*** 正在初始化 Mininet (BA模型 Seed={seed}, DockerID={docker_id})\n')
+def build_switch_topo(seed, docker_id, preset_name="ba_core"):
+    if preset_name not in INTRA_PRESETS:
+        raise ValueError(f"Unknown intra preset: {preset_name}")
+
+    cfg = INTRA_PRESETS[preset_name]
+    info(
+        f"*** 正在初始化 Mininet (Preset={preset_name}, Seed={seed}, DockerID={docker_id})\n"
+    )
 
     # 随机数种子设置，保证每次生成的QoS参数一致但随机
     random.seed(seed)
 
     net = Mininet(controller=None, switch=OVSKernelSwitch)
 
-    # 生成图
-    G = nx.barabasi_albert_graph(n=NUM_SWITCHES, m=BA_M, seed=seed)
+    # 按预设生成域内拓扑图
+    G = build_intra_graph(preset_name, seed)
+    info(f"*** 域内预设: {preset_name} ({cfg['desc']})\n")
 
     nx_node_to_switch = {}
     for i in G.nodes():
@@ -239,9 +287,26 @@ def baSwitchTopo(seed, docker_id):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--seed', type=int, default=1)
-    parser.add_argument('--id', type=int, required=True, help='Docker Container ID')
+    parser.add_argument('--id', type=int, help='Docker Container ID')
+    parser.add_argument(
+        '--preset',
+        default='ba_core',
+        help='Intra-domain topology preset'
+    )
+    parser.add_argument(
+        '--list-presets',
+        action='store_true',
+        help='List all intra-domain presets'
+    )
     args = parser.parse_args()
 
-    setLogLevel('info')
-    baSwitchTopo(args.seed, args.id)
+    if args.list_presets:
+        print("Available intra-domain presets:")
+        for name in sorted(INTRA_PRESETS.keys()):
+            print(f"  - {name}: {INTRA_PRESETS[name]['desc']}")
+        sys.exit(0)
+    if args.id is None:
+        parser.error("the following arguments are required: --id")
 
+    setLogLevel('info')
+    build_switch_topo(args.seed, args.id, args.preset)
