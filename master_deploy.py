@@ -13,6 +13,9 @@ DOMAIN_SCRIPT_IN = "autobuild_in_agent.py"
 NUM_CONTAINERS = 5
 TOPO_READY_TIMEOUT = 180  # 等待拓扑就绪最长时间（秒）
 TOPO_POLL_INTERVAL = 2    # 就绪检测轮询间隔（秒）
+INTRA_RESTART_AFTER = 45  # 单容器超过该时间未就绪，触发重启（秒）
+INTRA_MAX_RETRIES = 1     # 每个容器最多自动重试次数
+INTRA_START_STAGGER = 0.2  # 域内进程启动错峰（秒）
 
 
 def run_cmd(cmd):
@@ -41,6 +44,20 @@ def container_topo_ready(container_name):
         "python3 -c \"import json; json.load(open('/root/topo_db.json'))\""
     )
     return run_cmd_ok(check_cmd)
+
+
+def restart_intra_agent(container_name, seed, docker_id, preset, quiet):
+    """
+    重启容器内 topo_agent，避免个别容器启动卡死导致整体等待过长。
+    """
+    quiet_flag = " --quiet" if quiet else ""
+    run_cmd_ok(f"sudo docker exec {container_name} pkill -f topo_agent.py")
+    run_cmd_ok(f"sudo docker exec {container_name} rm -f /root/topo_db.json")
+    cmd = (
+        f"sudo docker exec -d {container_name} python3 /root/topo_agent.py "
+        f"--seed {seed} --id {docker_id} --preset {preset}{quiet_flag}"
+    )
+    return run_cmd_ok(cmd)
 
 
 def reset_runtime_state():
@@ -100,6 +117,29 @@ def parse_args():
         help="Base seed for intra-domain generation; docker i uses seed=(base+i-1)",
     )
     parser.add_argument(
+        "--intra-verbose",
+        action="store_true",
+        help="Enable verbose logs from topo_agent inside containers",
+    )
+    parser.add_argument(
+        "--intra-restart-after",
+        type=float,
+        default=INTRA_RESTART_AFTER,
+        help="Restart single container topo_agent if not ready after N seconds",
+    )
+    parser.add_argument(
+        "--intra-max-retries",
+        type=int,
+        default=INTRA_MAX_RETRIES,
+        help="Max auto-restart attempts per container",
+    )
+    parser.add_argument(
+        "--intra-start-stagger",
+        type=float,
+        default=INTRA_START_STAGGER,
+        help="Small stagger delay between starting container topo_agent",
+    )
+    parser.add_argument(
         "--list-inter-presets",
         action="store_true",
         help="List inter-domain presets and exit",
@@ -138,8 +178,13 @@ def main(args):
     print("\n" + "=" * 40)
     print("STEP 2: 部署域内网络 (Mininet inside Docker)")
     print("=" * 40)
+    intra_quiet = not args.intra_verbose
     print(f"Inter preset: {args.inter_preset} (seed={args.inter_seed})")
     print(f"Intra preset: {args.intra_preset} (seed base={args.intra_seed_base})")
+    print(
+        f"Intra startup: quiet={intra_quiet} restart_after={args.intra_restart_after}s "
+        f"max_retries={args.intra_max_retries} stagger={args.intra_start_stagger}s"
+    )
 
     # 准备数据目录
     if not os.path.exists("topo_data"):
@@ -149,6 +194,7 @@ def main(args):
     if os.path.exists("inter_domain_db.json"):
         run_cmd("mv inter_domain_db.json topo_data/")
 
+    deploy_meta = {}
     for i in range(1, NUM_CONTAINERS + 1):
         container_name = f"docker{i}"
         seed = args.intra_seed_base + i - 1
@@ -161,13 +207,16 @@ def main(args):
         )
 
         # 后台运行 (传入 --id)
-        cmd = (
-            f"sudo docker exec -d {container_name} python3 /root/topo_agent.py "
-            f"--seed {seed} --id {i} --preset {args.intra_preset}"
-        )
-        run_cmd(cmd)
+        if not restart_intra_agent(
+            container_name, seed, i, args.intra_preset, intra_quiet
+        ):
+            print(f"Error executing topo_agent in {container_name}")
+            sys.exit(1)
 
         print(f"  -> {container_name} started.")
+        deploy_meta[container_name] = {"seed": seed, "id": i}
+        if args.intra_start_stagger > 0:
+            time.sleep(args.intra_start_stagger)
 
     # 3. 轮询就绪并回收拓扑数据（替代固定等待）
     print("\n" + "=" * 40)
@@ -178,6 +227,8 @@ def main(args):
     )
 
     pending = {f"docker{i}" for i in range(1, NUM_CONTAINERS + 1)}
+    pending_start = {c: time.time() for c in pending}
+    pending_retries = {c: 0 for c in pending}
     deadline = time.time() + TOPO_READY_TIMEOUT
 
     while pending and time.time() < deadline:
@@ -188,12 +239,40 @@ def main(args):
                     f"sudo docker cp {c_name}:/root/topo_db.json ./topo_data/{c_name}_topo.json"
                 ):
                     pending.remove(c_name)
+                    pending_start.pop(c_name, None)
+                    pending_retries.pop(c_name, None)
                     print(f"     [OK] {c_name} 拓扑数据已回收")
                 else:
                     print(f"     [Warning] {c_name} 拷贝失败，稍后重试")
+                continue
+
+            # 长时间未就绪则自动重启，避免个别容器卡死拖慢整体
+            elapsed = time.time() - pending_start.get(c_name, time.time())
+            if (
+                elapsed >= args.intra_restart_after
+                and pending_retries.get(c_name, 0) < args.intra_max_retries
+            ):
+                pending_retries[c_name] += 1
+                meta = deploy_meta[c_name]
+                print(
+                    f"  [Retry] {c_name} 未就绪 {elapsed:.1f}s，重启 topo_agent "
+                    f"(attempt {pending_retries[c_name]}/{args.intra_max_retries})"
+                )
+                ok = restart_intra_agent(
+                    c_name, meta["seed"], meta["id"], args.intra_preset, intra_quiet
+                )
+                if ok:
+                    pending_start[c_name] = time.time()
+                else:
+                    print(f"  [Warning] {c_name} topo_agent 重启失败，继续轮询")
 
         if pending:
-            print(f"  ...等待中，未就绪: {', '.join(sorted(pending))}")
+            waiting = []
+            for c_name in sorted(pending):
+                wait_s = int(time.time() - pending_start.get(c_name, time.time()))
+                retry = pending_retries.get(c_name, 0)
+                waiting.append(f"{c_name}({wait_s}s,r{retry})")
+            print(f"  ...等待中，未就绪: {', '.join(waiting)}")
             time.sleep(TOPO_POLL_INTERVAL)
 
     # 超时后的兜底提示
