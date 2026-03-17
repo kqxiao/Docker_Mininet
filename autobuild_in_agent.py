@@ -24,6 +24,14 @@ INTRA_PRESETS = {
 }
 # ===========================================
 
+QUIET = False
+
+
+def log(msg):
+    if not QUIET:
+        info(msg)
+
+
 def run_cmd(cmd, ignore_error=False):
     try:
         subprocess.check_call(cmd, shell=True, stderr=subprocess.STDOUT)
@@ -45,6 +53,23 @@ def _build_connected_er_graph(n, p, seed):
     raise RuntimeError("Failed to build a connected ER graph after 256 attempts.")
 
 
+def _build_random_tree_compat(n, seed):
+    """
+    兼容不同 networkx 版本的随机树生成。
+    """
+    if hasattr(nx, "random_labeled_tree"):
+        return nx.random_labeled_tree(n=n, seed=seed)
+    if hasattr(nx.generators.trees, "random_labeled_tree"):
+        return nx.generators.trees.random_labeled_tree(n=n, seed=seed)
+
+    # networkx 2.4 等旧版本回退：使用 Prüfer 序列构造随机树
+    rng = random.Random(seed)
+    prufer = [rng.randrange(n) for _ in range(n - 2)]
+    if hasattr(nx, "from_prufer_sequence"):
+        return nx.from_prufer_sequence(prufer)
+    return nx.generators.trees.from_prufer_sequence(prufer)
+
+
 def build_intra_graph(preset_name, seed):
     if preset_name not in INTRA_PRESETS:
         raise ValueError(f"Unknown intra preset: {preset_name}")
@@ -64,7 +89,7 @@ def build_intra_graph(preset_name, seed):
     if t == "er":
         return _build_connected_er_graph(n=n, p=cfg["p"], seed=seed)
     if t == "tree":
-        return nx.random_labeled_tree(n=n, seed=seed)
+        return _build_random_tree_compat(n=n, seed=seed)
 
     raise ValueError(f"Unsupported intra topology type: {t}")
 
@@ -91,7 +116,7 @@ def get_external_interfaces():
                         interfaces.append(iface_name)
 
     except Exception as e:
-        info(f"*** Error getting interfaces: {e}\n")
+        log(f"*** Error getting interfaces: {e}\n")
 
     # 排序，确保 eth0 在 eth1 前面
     interfaces.sort(key=lambda x: int(x.replace("eth", "")))
@@ -103,23 +128,23 @@ def attach_external_links(net, G, nx_node_to_switch):
     将容器外部接口挂载到 Mininet 核心交换机
     返回: external_map { 'sX': ['eth0', 'eth1'] } 用于记录拓扑
     """
-    info('\n*** 正在检测外部接口并挂载到核心交换机...\n')
+    log('\n*** 正在检测外部接口并挂载到核心交换机...\n')
     ext_ifaces = get_external_interfaces()
     external_map = {}
 
     if not ext_ifaces:
-        info('*** 未检测到外部接口 (ethX)，跳过挂载。\n')
+        log('*** 未检测到外部接口 (ethX)，跳过挂载。\n')
         return external_map
 
     degrees = sorted(G.degree(), key=lambda x: x[1], reverse=True)
-    info(f'*** 检测到外部接口: {ext_ifaces}\n')
+    log(f'*** 检测到外部接口: {ext_ifaces}\n')
 
     for i, iface in enumerate(ext_ifaces):
         node_id, degree = degrees[i % len(degrees)]
         target_switch = nx_node_to_switch[node_id]
         sw_name = target_switch.name
 
-        info(f'    [绑定] {iface} <---> {sw_name} (Degree: {degree})\n')
+        log(f'    [绑定] {iface} <---> {sw_name} (Degree: {degree})\n')
 
         run_cmd(f"ip link set {iface} up")
         run_cmd(f"ovs-vsctl add-port {sw_name} {iface}")
@@ -144,7 +169,7 @@ def save_topology(net, docker_id, external_map, qos_data):
         "hosts": {}      # h1: { "ip":..., "mac":..., "connected_to": "s1", "port_on_switch": "s1-eth2" }
     }
     """
-    info('*** Saving topology to /root/topo_db.json...\n')
+    log('*** Saving topology to /root/topo_db.json...\n')
 
     topo_data = {"docker_id": docker_id, "switches": {}, "hosts": {}}
 
@@ -219,7 +244,7 @@ def build_switch_topo(seed, docker_id, preset_name="ba_core"):
         raise ValueError(f"Unknown intra preset: {preset_name}")
 
     cfg = INTRA_PRESETS[preset_name]
-    info(
+    log(
         f"*** 正在初始化 Mininet (Preset={preset_name}, Seed={seed}, DockerID={docker_id})\n"
     )
 
@@ -230,7 +255,7 @@ def build_switch_topo(seed, docker_id, preset_name="ba_core"):
 
     # 按预设生成域内拓扑图
     G = build_intra_graph(preset_name, seed)
-    info(f"*** 域内预设: {preset_name} ({cfg['desc']})\n")
+    log(f"*** 域内预设: {preset_name} ({cfg['desc']})\n")
 
     nx_node_to_switch = {}
     for i in G.nodes():
@@ -244,7 +269,7 @@ def build_switch_topo(seed, docker_id, preset_name="ba_core"):
         host_ip = f'10.0.{docker_id}.{idx}/24'
         host_mac = f'00:00:00:00:{docker_id:02x}:{idx:02x}'
 
-        info(
+        log(
             f'    [添加主机] {host_name} -> {sw_name} (IP={host_ip}, MAC={host_mac})\n'
         )
         host = net.addHost(host_name, ip=host_ip, mac=host_mac)
@@ -264,9 +289,9 @@ def build_switch_topo(seed, docker_id, preset_name="ba_core"):
         key = tuple(sorted((u, v)))
         qos_data[key] = {'bw': bw}
 
-        info(f"    [Link QoS] s{u+1}-s{v+1}: BW={bw}Mbps\n")
+        log(f"    [Link QoS] s{u+1}-s{v+1}: BW={bw}Mbps\n")
 
-    info('*** Starting network\n')
+    log('*** Starting network\n')
     net.start()
 
     # === 挂载外部接口并获取映射 ===
@@ -276,7 +301,7 @@ def build_switch_topo(seed, docker_id, preset_name="ba_core"):
     # 传入 qos_data 进行保存
     save_topology(net, docker_id, ext_map, qos_data)
 
-    info('*** Network is running in BACKGROUND.\n')
+    log('*** Network is running in BACKGROUND.\n')
     try:
         while True:
             time.sleep(10)
@@ -298,6 +323,11 @@ if __name__ == '__main__':
         action='store_true',
         help='List all intra-domain presets'
     )
+    parser.add_argument(
+        '--quiet',
+        action='store_true',
+        help='Reduce startup logs for faster/stabler deployment'
+    )
     args = parser.parse_args()
 
     if args.list_presets:
@@ -308,5 +338,6 @@ if __name__ == '__main__':
     if args.id is None:
         parser.error("the following arguments are required: --id")
 
-    setLogLevel('info')
+    QUIET = args.quiet
+    setLogLevel('warning' if args.quiet else 'info')
     build_switch_topo(args.seed, args.id, args.preset)

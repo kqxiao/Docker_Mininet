@@ -84,6 +84,51 @@ sudo python3 master_deploy.py --inter-preset ring5 --intra-preset ws20
 sudo python3 master_deploy.py --inter-preset mesh5 --intra-preset er20
 ```
 
+### 2.4.2 域内拓扑建立优化说明（减少等待时间）
+
+为降低“域内拓扑长时间未就绪”的概率，当前版本做了以下优化：
+
+1. `topo_agent` 默认静默启动（`--quiet`）
+- 位置：`autobuild_in_agent.py`
+- 机制：减少容器内大量 `info` 打印与 Mininet 启动日志输出，降低 I/O 开销和启动抖动。
+- 效果：5 个容器并发拉起时更稳定，平均就绪时间更短。
+
+2. 启动错峰（`--intra-start-stagger`）
+- 位置：`master_deploy.py`
+- 机制：5 个容器不是完全同一时刻启动域内构建，而是按小间隔依次启动（默认 0.2 秒）。
+- 效果：降低同一时刻 CPU/内核网络资源争抢，减少个别容器“卡住”概率。
+
+3. 自动重试拉起（`--intra-restart-after` + `--intra-max-retries`）
+- 位置：`master_deploy.py`
+- 机制：若某个容器在设定时间内仍未生成 `/root/topo_db.json`，自动重启该容器内 `topo_agent`。
+- 默认值：
+  - `--intra-restart-after 45`（单容器 45 秒未就绪触发重启）
+  - `--intra-max-retries 1`（每个容器最多自动重试 1 次）
+- 效果：避免“个别容器卡死导致整体等待到总超时”的情况。
+
+4. 更直观的等待信息
+- 位置：`master_deploy.py`
+- 机制：等待输出改为 `dockerX(等待秒数,重试次数)` 格式，例如 `docker3(47s,r1)`。
+- 效果：可直接看到是“慢”还是“卡”，便于调参。
+
+常用命令（已启用优化默认参数）：
+```bash
+sudo python3 master_deploy.py --inter-preset ring5 --intra-preset ring20
+```
+
+需要更激进减少等待时（可选）：
+```bash
+sudo python3 master_deploy.py --inter-preset ring5 --intra-preset ring20 \
+  --intra-restart-after 30 \
+  --intra-max-retries 2 \
+  --intra-start-stagger 0.15
+```
+
+如果要排查容器内启动细节（打开详细日志）：
+```bash
+sudo python3 master_deploy.py --inter-preset ring5 --intra-preset ring20 --intra-verbose
+```
+
 
 ### 2.5 单条业务算路与下发（示例）
 ```bash

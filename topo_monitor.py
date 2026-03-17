@@ -89,9 +89,74 @@ def is_container_running(container_name):
     return ok and output.strip().lower() == "true"
 
 
-def is_switch_alive(container_name, switch_name, container_states):
+def _parse_iface_state_map(ip_link_output):
+    """
+    解析 `ip -o link show` 输出，返回 {iface: is_up}。
+    """
+    iface_state = {}
+    for line in (ip_link_output or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(r"^\d+:\s*([^:@]+)", line)
+        if not m:
+            continue
+        iface = m.group(1).strip()
+        if "state DOWN" in line:
+            iface_state[iface] = False
+        else:
+            iface_state[iface] = ("UP" in line) or ("LOWER_UP" in line)
+    return iface_state
+
+
+def get_container_iface_map(container_name, container_states=None):
+    """
+    一次性获取容器内所有接口状态，避免逐接口 docker exec。
+    """
+    if container_states is not None and not container_states.get(container_name, False):
+        return {}
+
+    ok, output = run_cmd(_with_sudo(f"docker exec {container_name} ip -o link show"))
+    if not ok:
+        return {}
+    return _parse_iface_state_map(output)
+
+
+def get_container_switch_set(container_name, container_states=None):
+    """
+    一次性获取容器内 OVS bridge 列表，避免逐交换机探测。
+    """
+    if container_states is not None and not container_states.get(container_name, False):
+        return set()
+
+    ok, output = run_cmd(_with_sudo(f"docker exec {container_name} ovs-vsctl list-br"))
+    if not ok:
+        return set()
+    return {line.strip() for line in output.splitlines() if line.strip()}
+
+
+def _build_runtime_probe_cache(container_states):
+    """
+    每轮监控缓存：
+      - iface_maps: {container: {iface: up/down}}
+      - switch_sets: {container: {s1,s2,...}}
+    """
+    iface_maps = {}
+    switch_sets = {}
+    for c_name, is_up in container_states.items():
+        if not is_up:
+            continue
+        iface_maps[c_name] = get_container_iface_map(c_name, container_states)
+        switch_sets[c_name] = get_container_switch_set(c_name, container_states)
+    return iface_maps, switch_sets
+
+
+def is_switch_alive(container_name, switch_name, container_states, switch_sets=None):
     if not container_states.get(container_name, False):
         return False
+    if switch_sets is not None and container_name in switch_sets:
+        return switch_name in switch_sets[container_name]
+
     ok, _ = run_cmd(_with_sudo(f"docker exec {container_name} ovs-vsctl br-exists {switch_name}"))
     if not ok:
         return False
@@ -99,12 +164,16 @@ def is_switch_alive(container_name, switch_name, container_states):
     return ok
 
 
-def get_container_iface_status(container_name, iface, container_states=None):
+def get_container_iface_status(
+    container_name, iface, container_states=None, iface_maps=None
+):
     """
     返回 True (UP) 或 False (DOWN/Error)
     """
     if container_states is not None and not container_states.get(container_name, False):
         return False
+    if iface_maps is not None and container_name in iface_maps:
+        return iface_maps[container_name].get(iface, False)
 
     ok, output = run_cmd(_with_sudo(f"docker exec {container_name} ip -o link show {iface}"))
     if not ok:
@@ -473,12 +542,17 @@ def handle_failures_and_reroute(
 def sync_inter_domain_topology(last_container_states):
     if not os.path.exists(INTER_DOMAIN_FILE):
         print(f"[Warning] {INTER_DOMAIN_FILE} not found. Waiting for deployment...")
+        known_containers = set(last_container_states.keys()) | set(_load_intra_topologies().keys())
+        container_states = {c: is_container_running(c) for c in known_containers}
+        iface_maps, switch_sets = _build_runtime_probe_cache(container_states)
         return {
             "failure_links": [],
             "recovered_links": [],
             "node_failures": [],
             "node_recoveries": [],
-            "container_states": last_container_states,
+            "container_states": container_states,
+            "iface_maps": iface_maps,
+            "switch_sets": switch_sets,
         }
 
     print(f"\n[{time.strftime('%H:%M:%S')}] Monitoring Inter-Domain Topology...")
@@ -506,6 +580,7 @@ def sync_inter_domain_topology(last_container_states):
         all_containers.add(c_name)
 
     container_states = {c: is_container_running(c) for c in all_containers}
+    iface_maps, switch_sets = _build_runtime_probe_cache(container_states)
     node_failures = []
     node_recoveries = []
     for c_name, is_up in container_states.items():
@@ -526,8 +601,8 @@ def sync_inter_domain_topology(last_container_states):
         d_c = link['dst_container']
         d_if = link['dst_iface']
 
-        src_up = get_container_iface_status(s_c, s_if, container_states)
-        dst_up = get_container_iface_status(d_c, d_if, container_states)
+        src_up = get_container_iface_status(s_c, s_if, container_states, iface_maps)
+        dst_up = get_container_iface_status(d_c, d_if, container_states, iface_maps)
 
         is_alive = src_up and dst_up
         current_bw = link['qos']['bw']
@@ -575,10 +650,14 @@ def sync_inter_domain_topology(last_container_states):
         "node_failures": node_failures,
         "node_recoveries": node_recoveries,
         "container_states": container_states,
+        "iface_maps": iface_maps,
+        "switch_sets": switch_sets,
     }
 
 
-def sync_intra_domain_topology(container_states, last_switch_states):
+def sync_intra_domain_topology(
+    container_states, last_switch_states, iface_maps=None, switch_sets=None
+):
     print(f"[{time.strftime('%H:%M:%S')}] Monitoring Intra-Domain Topology...")
     topos = _load_intra_topologies()
 
@@ -595,7 +674,7 @@ def sync_intra_domain_topology(container_states, last_switch_states):
             if not sw.startswith("s"):
                 continue
             key = f"{c_name}:{sw}"
-            alive = is_switch_alive(c_name, sw, container_states)
+            alive = is_switch_alive(c_name, sw, container_states, switch_sets)
             local_switch_status[sw] = alive
             switch_states[key] = alive
 
@@ -647,8 +726,8 @@ def sync_intra_domain_topology(container_states, last_switch_states):
 
             port_u = info_uv.get("port")
             port_v = info_vu.get("port")
-            up_u = get_container_iface_status(c_name, port_u, container_states)
-            up_v = get_container_iface_status(c_name, port_v, container_states)
+            up_u = get_container_iface_status(c_name, port_u, container_states, iface_maps)
+            up_v = get_container_iface_status(c_name, port_v, container_states, iface_maps)
             is_alive = up_u and up_v
             current_bw = info_uv.get("bw", 0)
             key = tuple(sorted((u, v)))
@@ -723,13 +802,17 @@ if __name__ == "__main__":
     last_container_states = {}
     last_switch_states = {}
     try:
+        next_tick = time.monotonic()
         while True:
-            cycle_start = time.time()
+            cycle_start = time.monotonic()
             inter_events = sync_inter_domain_topology(last_container_states)
             last_container_states = inter_events["container_states"]
 
             intra_events = sync_intra_domain_topology(
-                inter_events["container_states"], last_switch_states
+                inter_events["container_states"],
+                last_switch_states,
+                inter_events.get("iface_maps"),
+                inter_events.get("switch_sets"),
             )
             last_switch_states = intra_events["switch_states"]
 
@@ -746,8 +829,13 @@ if __name__ == "__main__":
                     intra_events["intra_switch_failures"],
                 )
 
-            elapsed = time.time() - cycle_start
-            sleep_s = max(0.0, args.interval - elapsed)
+            elapsed = time.monotonic() - cycle_start
+            next_tick += args.interval
+            sleep_s = next_tick - time.monotonic()
+            if sleep_s < 0:
+                # 扫描耗时超过 interval 时不再额外 sleep，并重置节拍避免漂移累积。
+                sleep_s = 0.0
+                next_tick = time.monotonic()
             time.sleep(sleep_s)
     except KeyboardInterrupt:
         print("\nMonitor stopped.")
