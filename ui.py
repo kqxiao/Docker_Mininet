@@ -323,6 +323,7 @@ class SDN_GUI(tk.Tk):
         self.log_queue = queue.Queue()
         self.bg_processes = {}
         self._last_runtime_sig = None
+        self._topo_monitor_reroute_mode = False
 
         # 构建用户界面
         self._build_ui()
@@ -671,22 +672,37 @@ class SDN_GUI(tk.Tk):
         - 检测/故障识别信息 -> monitor
         - 重路由与重部署信息 -> terminal
         """
-        reroute_keywords = [
+        monitor_cycle_head = re.search(
+            r"^\[\d{2}:\d{2}:\d{2}\]\s+Monitoring\s+(Inter|Intra)-Domain\s+Topology\.\.\.",
+            line or "",
+        )
+        if monitor_cycle_head:
+            self._topo_monitor_reroute_mode = False
+            return "monitor"
+
+        reroute_start_keywords = [
             "Impacted active flows",
             "No active flow is affected.",
             "Releasing old reservation",
             ">>> Re-routing",
+            "Trying cached backup candidates",
+            "[Backup]",
             "Re-route deployed",
+            "Backup route deployed",
             "[REROUTE]",
             "[REROUTE AVG]",
             "[Fail] route_cal",
             "[Fail] route_path",
-            "[Inter-Down]",
-            "[Intra ",
         ]
-        for kw in reroute_keywords:
+        for kw in reroute_start_keywords:
             if kw in line:
+                self._topo_monitor_reroute_mode = True
                 return "terminal"
+
+        # 进入重路由阶段后，直到下一个 Monitoring 周期头，整段都写到终端。
+        if self._topo_monitor_reroute_mode:
+            return "terminal"
+
         return "monitor"
 
     def _stream_process_output(self, name, proc, target):
@@ -928,6 +944,7 @@ class SDN_GUI(tk.Tk):
 
     def stop_topology_monitor(self):
         """暂停拓扑检测。"""
+        self._topo_monitor_reroute_mode = False
         if not self._is_bg_running("topo_monitor"):
             self._set_monitor_button(False)
             self._log_monitor(">>> 拓扑检测当前未运行\n")
@@ -938,6 +955,7 @@ class SDN_GUI(tk.Tk):
 
     def start_topology_monitor(self):
         """后台启动拓扑检测脚本并实时显示检测信息。"""
+        self._topo_monitor_reroute_mode = False
         interval = self.monitor_interval.get().strip() or "5.0"
         try:
             interval_f = float(interval)

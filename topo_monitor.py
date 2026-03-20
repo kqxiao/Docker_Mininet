@@ -44,34 +44,66 @@ def _build_path_filename(src, dst, bw):
     return f"{p1}_{p2}_{int(float(bw))}.json"
 
 
-def _load_best_path_display(src, dst, bw):
-    """
-    从 topo_path 读取 rank=0 的路径，并转成展示字符串。
-    """
+def _load_path_candidates(src, dst, bw):
     path_file = os.path.join(PATH_DIR, _build_path_filename(src, dst, bw))
     if not os.path.exists(path_file):
-        return None
+        return []
     try:
         with open(path_file, "r") as f:
             data = json.load(f)
-        if not isinstance(data, list) or not data:
-            return None
-        cand = data[0]
-        full = []
-        for seg in cand.get("segments", []):
-            c_name = seg.get("container")
-            for node in seg.get("path", []):
-                if c_name and node:
-                    full.append(f"{c_name}-{node}")
-        cleaned = []
-        for n in full:
-            if not cleaned or cleaned[-1] != n:
-                cleaned.append(n)
-        if len(cleaned) < 2:
-            return None
-        return " -> ".join(n.replace("docker", "domain") for n in cleaned)
+        if isinstance(data, list):
+            return data
     except Exception:
+        pass
+    return []
+
+
+def _candidate_to_display(cand):
+    if not isinstance(cand, dict):
         return None
+    full = []
+    for seg in cand.get("segments", []):
+        c_name = seg.get("container")
+        for node in seg.get("path", []):
+            if c_name and node:
+                full.append(f"{c_name}-{node}")
+    cleaned = []
+    for n in full:
+        if not cleaned or cleaned[-1] != n:
+            cleaned.append(n)
+    if len(cleaned) < 2:
+        return None
+    return " -> ".join(n.replace("docker", "domain") for n in cleaned)
+
+
+def _load_path_display(src, dst, bw, path_idx=0):
+    cands = _load_path_candidates(src, dst, bw)
+    if path_idx < 0 or path_idx >= len(cands):
+        return None
+    return _candidate_to_display(cands[path_idx])
+
+
+def _load_best_path_display(src, dst, bw):
+    """
+    兼容旧调用：读取 rank=0 的路径展示。
+    """
+    return _load_path_display(src, dst, bw, 0)
+
+
+def _is_route_cal_success(ok, out, src, dst, bw):
+    if not ok:
+        return False
+    # route_cal.py 失败时有些场景返回码仍为 0，这里用结果文件兜底判断。
+    if "Calculation Complete. Paths saved to:" in (out or ""):
+        return True
+    return len(_load_path_candidates(src, dst, bw)) > 0
+
+
+def _is_route_deploy_success(ok, out):
+    if not ok:
+        return False
+    # route_path.py 在带宽不足时可能仅打印错误但仍返回 0。
+    return "Deployment & Update Complete." in (out or "")
 
 
 def run_cmd(cmd):
@@ -436,46 +468,104 @@ def reroute_flow(flow_record):
             "route_gen_time": None,
             "route_switch_time": None,
             "path": None,
+            "mode": None,
+            "path_index": None,
         }
 
     bw_str = _normalize_bw_str(bw)
     print(f"\n>>> Re-routing {src} -> {dst} (BW={bw_str} Mbps)")
 
+    # 1) 优先尝试之前算出的冗余候选路径（不重新算路）
+    route_meta = flow_record.get("route", {})
+    old_idx = route_meta.get("path_index", 0)
+    try:
+        old_idx = int(old_idx)
+    except Exception:
+        old_idx = 0
+
+    candidates = _load_path_candidates(src, dst, bw_str)
+    backup_indices = [i for i in range(len(candidates)) if i != old_idx]
+    if backup_indices:
+        print(f"  Trying cached backup candidates: {backup_indices}")
+
+    for idx in backup_indices:
+        print(f"  [Backup] Try candidate index={idx}")
+        cmd_deploy = _with_sudo(
+            f"python3 route_path.py {src} {dst} {bw_str} --index {idx}"
+        )
+        t1 = time.time()
+        ok, out = run_cmd(cmd_deploy)
+        route_switch_time = _extract_exec_time(out)
+        if route_switch_time is None:
+            route_switch_time = time.time() - t1
+
+        if _is_route_deploy_success(ok, out):
+            path_display = _load_path_display(src, dst, bw_str, idx)
+            print(f"  [OK] Backup route deployed for {src}->{dst} (index={idx})")
+            if path_display:
+                print(f"  [REROUTE] Path: {path_display}")
+            else:
+                print("  [REROUTE] Path: <unavailable>")
+            print(
+                f"  [REROUTE] Time: route_gen=0.0000s | route_switch={route_switch_time:.4f}s"
+            )
+            return {
+                "success": True,
+                "route_gen_time": 0.0,
+                "route_switch_time": route_switch_time,
+                "path": path_display,
+                "mode": "backup",
+                "path_index": idx,
+            }
+
+        print(f"  [Backup] Candidate index={idx} unavailable, trying next...")
+
+    if candidates:
+        print("  [Backup] No cached backup candidate is deployable. Fallback to re-calc.")
+    else:
+        print("  [Backup] No cached candidate file found. Fallback to re-calc.")
+
+    # 2) 兜底：重新算路并部署 rank=0
     cmd_cal = _with_sudo(f"python3 route_cal.py {src} {dst} {bw_str}")
     t0 = time.time()
     ok, out = run_cmd(cmd_cal)
     route_gen_time = _extract_exec_time(out)
     if route_gen_time is None:
         route_gen_time = time.time() - t0
-    if not ok:
+    if not _is_route_cal_success(ok, out, src, dst, bw_str):
         print(f"  [Fail] route_cal failed for {src}->{dst}")
-        print(out.strip())
+        if out:
+            print(out.strip())
         return {
             "success": False,
             "route_gen_time": route_gen_time,
             "route_switch_time": None,
             "path": None,
+            "mode": "recalculated",
+            "path_index": None,
         }
 
-    path_display = _load_best_path_display(src, dst, bw_str)
-
+    path_display = _load_path_display(src, dst, bw_str, 0)
     cmd_deploy = _with_sudo(f"python3 route_path.py {src} {dst} {bw_str} --index 0")
     t1 = time.time()
     ok, out = run_cmd(cmd_deploy)
     route_switch_time = _extract_exec_time(out)
     if route_switch_time is None:
         route_switch_time = time.time() - t1
-    if not ok:
-        print(f"  [Fail] route_path failed for {src}->{dst}")
-        print(out.strip())
+    if not _is_route_deploy_success(ok, out):
+        print(f"  [Fail] route_path failed for {src}->{dst} (index=0)")
+        if out:
+            print(out.strip())
         return {
             "success": False,
             "route_gen_time": route_gen_time,
             "route_switch_time": route_switch_time,
             "path": path_display,
+            "mode": "recalculated",
+            "path_index": 0,
         }
 
-    print(f"  [OK] Re-route deployed for {src}->{dst}")
+    print(f"  [OK] Re-route deployed for {src}->{dst} (index=0)")
     if path_display:
         print(f"  [REROUTE] Path: {path_display}")
     else:
@@ -488,6 +578,8 @@ def reroute_flow(flow_record):
         "route_gen_time": route_gen_time,
         "route_switch_time": route_switch_time,
         "path": path_display,
+        "mode": "recalculated",
+        "path_index": 0,
     }
 
 
