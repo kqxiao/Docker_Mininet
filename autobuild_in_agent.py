@@ -21,6 +21,58 @@ INTRA_PRESETS = {
     "ws20": {"desc": "WS小世界(20,4,0.25)", "type": "ws", "n": 20, "k": 4, "p": 0.25},
     "er20": {"desc": "ER随机图(20,0.18,保证连通)", "type": "er", "n": 20, "p": 0.18},
     "tree20": {"desc": "20节点随机树", "type": "tree", "n": 20},
+    # 固定场景-步兵：分簇协同 + 邻域横向互联
+    "infantry_fixed": {
+        "desc": "固定场景-步兵域内(20节点)",
+        "type": "fixed",
+        "n": 20,
+        "edges": [
+            (1, 2), (1, 3), (1, 4), (1, 5),
+            (6, 7), (6, 8), (6, 9), (6, 10),
+            (11, 12), (11, 13), (11, 14), (11, 15),
+            (16, 17), (16, 18), (16, 19), (16, 20),
+            (1, 6), (6, 11), (11, 16),
+            (3, 8), (8, 13), (13, 18),
+            (5, 10), (10, 15), (15, 20),
+            (2, 7), (12, 17),
+        ],
+    },
+    # 固定场景-侦查：主干串接 + 前出分队支链 + 中继环
+    "recon_fixed": {
+        "desc": "固定场景-侦查域内(20节点)",
+        "type": "fixed",
+        "n": 20,
+        "edges": [
+            (1, 2), (2, 3), (3, 4), (4, 5), (5, 6),
+            (1, 7), (1, 8),
+            (2, 9), (2, 10),
+            (3, 11), (3, 12),
+            (4, 13), (4, 14),
+            (5, 15), (5, 16),
+            (6, 17), (6, 18),
+            (3, 19), (5, 19),
+            (2, 20), (4, 20),
+            (19, 20),
+        ],
+    },
+    # 固定场景-火力支援：双核心 + 火力/观测分组
+    "fire_support_fixed": {
+        "desc": "固定场景-火力支援域内(20节点)",
+        "type": "fixed",
+        "n": 20,
+        "edges": [
+            (1, 2), (1, 3), (1, 4), (1, 5),
+            (2, 3), (2, 4), (2, 6),
+            (3, 7), (3, 8),
+            (4, 9), (4, 10),
+            (5, 11), (5, 12),
+            (6, 13), (6, 14),
+            (7, 15), (8, 16),
+            (9, 17), (10, 18),
+            (11, 19), (12, 20),
+            (13, 19), (14, 20),
+        ],
+    },
 }
 # ===========================================
 
@@ -70,6 +122,24 @@ def _build_random_tree_compat(n, seed):
     return nx.generators.trees.from_prufer_sequence(prufer)
 
 
+def _build_fixed_graph(n, edges, one_based=True):
+    G = nx.Graph()
+    G.add_nodes_from(range(n))
+
+    for u, v in edges:
+        if one_based:
+            u -= 1
+            v -= 1
+        if not (0 <= u < n and 0 <= v < n):
+            raise ValueError(f"Fixed edge out of range: ({u}, {v}) with n={n}")
+        if u != v:
+            G.add_edge(u, v)
+
+    if not nx.is_connected(G):
+        raise RuntimeError("Fixed intra-domain topology is not connected.")
+    return G
+
+
 def build_intra_graph(preset_name, seed):
     if preset_name not in INTRA_PRESETS:
         raise ValueError(f"Unknown intra preset: {preset_name}")
@@ -90,6 +160,8 @@ def build_intra_graph(preset_name, seed):
         return _build_connected_er_graph(n=n, p=cfg["p"], seed=seed)
     if t == "tree":
         return _build_random_tree_compat(n=n, seed=seed)
+    if t == "fixed":
+        return _build_fixed_graph(n=n, edges=cfg["edges"], one_based=True)
 
     raise ValueError(f"Unsupported intra topology type: {t}")
 

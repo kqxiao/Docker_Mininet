@@ -17,6 +17,33 @@ INTER_PRESETS = {
     "ring5": {"desc": "5节点环形", "type": "ring", "n": 5},
     "star5": {"desc": "5节点星形(0为中心)", "type": "star", "n": 5},
     "mesh5": {"desc": "5节点全互联", "type": "complete", "n": 5},
+    # 固定场景拓扑（6域）
+    # Infantry: D1-D2,D1-D3,D2-D4,D2-D5,D3-D6,D4-D5,D5-D6
+    "infantry6": {
+        "desc": "固定场景-步兵(6域)",
+        "type": "fixed",
+        "n": 6,
+        "edges": [(1, 2), (1, 3), (2, 4), (2, 5), (3, 6), (4, 5), (5, 6)],
+    },
+    # Recon: D2-D1,D3-D1,D4-D1,D5-D1,D2-D6,D3-D6,D4-D6,D5-D6,D6-D1
+    "recon6": {
+        "desc": "固定场景-侦查(6域)",
+        "type": "fixed",
+        "n": 6,
+        "edges": [
+            (2, 1), (3, 1), (4, 1), (5, 1),
+            (2, 6), (3, 6), (4, 6), (5, 6),
+            (6, 1),
+        ],
+    },
+    # Fire support (按用户确认去掉 D2-D3, D6-D5)
+    # D1-D2,D1-D6,D1-D3,D1-D4,D1-D5,D3-D4,D4-D5,D3-D5
+    "fire_support6": {
+        "desc": "固定场景-火力支援(6域)",
+        "type": "fixed",
+        "n": 6,
+        "edges": [(1, 2), (1, 6), (1, 3), (1, 4), (1, 5), (3, 4), (4, 5), (3, 5)],
+    },
 }
 # ===========================================
 
@@ -45,6 +72,12 @@ def build_inter_graph(preset_name, seed):
         G = nx.star_graph(n - 1)
     elif t == "complete":
         G = nx.complete_graph(n)
+    elif t == "fixed":
+        G = nx.Graph()
+        G.add_nodes_from(range(n))
+        for u, v in cfg["edges"]:
+            # 配置用 1-based，下层图用 0-based
+            G.add_edge(u - 1, v - 1)
     else:
         raise ValueError(f"Unsupported inter topology type: {t}")
     return G

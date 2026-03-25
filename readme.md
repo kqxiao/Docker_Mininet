@@ -3,9 +3,9 @@
 ## 1. 文件分类与作用
 
 ### 1.1 拓扑构建与部署
-- `autobuild_out.py`：构建域间网络（Docker + 宿主机 OVS `br-sdn`），生成 `inter_domain_db.json`。
-- `autobuild_in_agent.py`：在每个 Docker 容器内构建域内 Mininet 拓扑（交换机/主机/链路），并导出 `topo_db.json`。
-- `master_deploy.py`：一键编排部署。先跑域间，再启动各容器域内拓扑，最后回收到 `topo_data/`。
+- `autobuild_out.py`：构建域间网络（Docker + 宿主机 OVS `br-sdn`），生成 `inter_domain_db.json`；支持随机预设与固定场景域间预设。
+- `autobuild_in_agent.py`：在每个 Docker 容器内构建域内 Mininet 拓扑（交换机/主机/链路），并导出 `topo_db.json`；支持随机预设与固定场景域内预设。
+- `master_deploy.py`：一键编排部署。先跑域间，再启动各容器域内拓扑，最后回收到 `topo_data/`；支持 `--scenario` 一键选择固定场景。
 
 ### 1.2 AI 算路模型
 - `gnn_lyx.py`：GNN 模型结构定义（注意力 + GRU + 读出层）。
@@ -23,7 +23,7 @@
 - 域内故障：交换机端口 down、交换机 down（被删除/不可用）。
 
 ### 1.5 UI 与工具
-- `ui.py`：图形界面入口（调用后端脚本算路和部署）。
+- `ui.py`：图形界面入口（调用后端脚本算路和部署），支持从 `topo_data/` 读取拓扑并按实际域数量动态显示图例。
 - `ovs-docker`：连接 Docker 容器网卡到 OVS 网桥的工具脚本。
 
 ### 1.6 镜像与启动脚本
@@ -55,13 +55,17 @@ python3 master_deploy.py --list-inter-presets
 
 # 域内拓扑预设
 python3 master_deploy.py --list-intra-presets
+
+# 固定场景映射（inter/intra 预设组合）
+python3 master_deploy.py --list-scenarios
 ```
 
 ### 2.4 选择不同拓扑进行建设（示例）
+#### 2.4.1 随机拓扑预设
 可用预设：
 
-域间：ba_core / ring5 / star5 / mesh5  
-域内：ba_core / ring20 / ws20 / er20 / tree20
+- 域间：`ba_core` / `ring5` / `star5` / `mesh5`
+- 域内：`ba_core` / `ring20` / `ws20` / `er20` / `tree20`
 
 预设含义说明：
 
@@ -84,18 +88,32 @@ sudo python3 master_deploy.py --inter-preset ring5 --intra-preset ws20
 sudo python3 master_deploy.py --inter-preset mesh5 --intra-preset er20
 ```
 
-### 2.4.2 域内拓扑建立优化说明（减少等待时间）
+#### 2.4.2 固定场景拓扑预设
+固定场景通过 `--scenario` 直接选择（会自动覆盖 `--inter-preset/--intra-preset`）：
+
+- `infantry`：步兵场景（6 域固定域间 + 步兵域内固定拓扑）
+- `recon`：侦查场景（6 域固定域间 + 侦查域内固定拓扑）
+- `fire_support`：火力支援场景（6 域固定域间 + 火力支援域内固定拓扑）
+
+```bash
+sudo python3 master_deploy.py --scenario infantry
+sudo python3 master_deploy.py --scenario recon
+sudo python3 master_deploy.py --scenario fire_support
+```
+
+
+#### 2.4.3 域内拓扑建立优化说明（减少等待时间）
 
 为降低“域内拓扑长时间未就绪”的概率，当前版本做了以下优化：
 
 1. `topo_agent` 默认静默启动（`--quiet`）
 - 位置：`autobuild_in_agent.py`
 - 机制：减少容器内大量 `info` 打印与 Mininet 启动日志输出，降低 I/O 开销和启动抖动。
-- 效果：5 个容器并发拉起时更稳定，平均就绪时间更短。
+- 效果：多容器并发拉起时更稳定，平均就绪时间更短。
 
 2. 启动错峰（`--intra-start-stagger`）
 - 位置：`master_deploy.py`
-- 机制：5 个容器不是完全同一时刻启动域内构建，而是按小间隔依次启动（默认 0.2 秒）。
+- 机制：各容器不是完全同一时刻启动域内构建，而是按小间隔依次启动（默认 0.2 秒）。
 - 效果：降低同一时刻 CPU/内核网络资源争抢，减少个别容器“卡住”概率。
 
 3. 自动重试拉起（`--intra-restart-after` + `--intra-max-retries`）
@@ -136,6 +154,7 @@ sudo python3 route_cal.py docker2:h1 docker5:h1 20
 sudo python3 route_path.py docker2:h1 docker5:h1 20 --index 0
 ```
 
+
 ### 2.6 批量业务（可选）
 ```bash
 sudo python3 route_batch.py test_traffic.txt
@@ -145,7 +164,7 @@ sudo python3 route_batch.py test_traffic.txt
 
 ### 3.1 启动监控
 ```bash
-sudo python3 topo_monitor.py --interval 2
+sudo python3 topo_monitor.py --interval 5
 ```
 
 ### 3.2 域间故障注入
@@ -179,7 +198,7 @@ sudo docker ps --format '{{.Names}}'
 
 # 连通性测试（示例：docker2:h1 -> docker5:h1）
 sudo docker exec docker2 m h1 ping -c 3 -W 1 10.0.5.1
-```
+
 
 ### 3.5 结束与恢复环境
 ```bash

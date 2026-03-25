@@ -6,16 +6,36 @@ import sys
 import time
 import os
 import argparse
+import json
+import re
 
 # 配置
 DOMAIN_SCRIPT_OUT = "autobuild_out.py"
 DOMAIN_SCRIPT_IN = "autobuild_in_agent.py"
-NUM_CONTAINERS = 5
+DEFAULT_NUM_CONTAINERS = 5
 TOPO_READY_TIMEOUT = 180  # 等待拓扑就绪最长时间（秒）
 TOPO_POLL_INTERVAL = 2    # 就绪检测轮询间隔（秒）
 INTRA_RESTART_AFTER = 45  # 单容器超过该时间未就绪，触发重启（秒）
 INTRA_MAX_RETRIES = 1     # 每个容器最多自动重试次数
 INTRA_START_STAGGER = 0.2  # 域内进程启动错峰（秒）
+
+SCENARIO_PRESETS = {
+    "infantry": {
+        "desc": "固定场景-步兵",
+        "inter_preset": "infantry6",
+        "intra_preset": "infantry_fixed",
+    },
+    "recon": {
+        "desc": "固定场景-侦查",
+        "inter_preset": "recon6",
+        "intra_preset": "recon_fixed",
+    },
+    "fire_support": {
+        "desc": "固定场景-火力支援",
+        "inter_preset": "fire_support6",
+        "intra_preset": "fire_support_fixed",
+    },
+}
 
 
 def run_cmd(cmd):
@@ -33,6 +53,69 @@ def run_cmd_ok(cmd):
     """
     result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return result.returncode == 0
+
+
+def _docker_sort_key(name):
+    m = re.search(r"(\d+)$", name or "")
+    return int(m.group(1)) if m else 10 ** 9
+
+
+def discover_running_domain_containers():
+    """
+    从当前运行中的容器列表中提取 dockerX（X为数字）的域容器名称。
+    """
+    try:
+        output = subprocess.check_output(
+            "sudo docker ps --format '{{.Names}}'",
+            shell=True,
+            stderr=subprocess.STDOUT,
+        ).decode("utf-8")
+    except subprocess.CalledProcessError:
+        return []
+
+    names = []
+    for line in output.splitlines():
+        name = line.strip()
+        if re.match(r"^docker\d+$", name):
+            names.append(name)
+    names.sort(key=_docker_sort_key)
+    return names
+
+
+def discover_containers_from_inter_db(inter_db_path):
+    """
+    从 inter_domain_db.json 中推断 docker 容器名列表。
+    """
+    if not inter_db_path or not os.path.exists(inter_db_path):
+        return []
+    try:
+        with open(inter_db_path, "r") as f:
+            links = json.load(f)
+    except Exception:
+        return []
+
+    names = set()
+    for item in links:
+        for key in ("src_container", "dst_container"):
+            name = item.get(key)
+            if isinstance(name, str) and re.match(r"^docker\d+$", name):
+                names.add(name)
+    return sorted(names, key=_docker_sort_key)
+
+
+def resolve_container_list(inter_db_path):
+    """
+    优先从运行中的 docker 容器发现域列表，其次从 inter_domain_db 推断。
+    """
+    names = discover_running_domain_containers()
+    if names:
+        return names
+
+    names = discover_containers_from_inter_db(inter_db_path)
+    if names:
+        return names
+
+    return [f"docker{i}" for i in range(1, DEFAULT_NUM_CONTAINERS + 1)]
 
 
 def container_topo_ready(container_name):
@@ -95,6 +178,11 @@ def parse_args():
         description="Build inter/intra domain network with selectable topology presets."
     )
     parser.add_argument(
+        "--scenario",
+        choices=sorted(SCENARIO_PRESETS.keys()),
+        help="Use fixed scenario presets (overrides --inter-preset/--intra-preset)",
+    )
+    parser.add_argument(
         "--inter-preset",
         default="ba_core",
         help="Inter-domain topology preset passed to autobuild_out.py",
@@ -149,6 +237,11 @@ def parse_args():
         action="store_true",
         help="List intra-domain presets and exit",
     )
+    parser.add_argument(
+        "--list-scenarios",
+        action="store_true",
+        help="List fixed scenario mappings and exit",
+    )
     return parser.parse_args()
 
 
@@ -159,6 +252,26 @@ def main(args):
     if args.list_intra_presets:
         run_cmd(f"python3 {DOMAIN_SCRIPT_IN} --list-presets")
         return
+    if args.list_scenarios:
+        print("Available fixed scenarios:")
+        for key in sorted(SCENARIO_PRESETS.keys()):
+            cfg = SCENARIO_PRESETS[key]
+            print(
+                f"  - {key}: {cfg['desc']} "
+                f"(inter={cfg['inter_preset']}, intra={cfg['intra_preset']})"
+            )
+        return
+
+    inter_preset = args.inter_preset
+    intra_preset = args.intra_preset
+    if args.scenario:
+        scenario_cfg = SCENARIO_PRESETS[args.scenario]
+        inter_preset = scenario_cfg["inter_preset"]
+        intra_preset = scenario_cfg["intra_preset"]
+        print(
+            f"[Scenario] {args.scenario}: "
+            f"inter={inter_preset}, intra={intra_preset}"
+        )
 
     # 0. 清理历史状态
     print("\n" + "=" * 40)
@@ -171,7 +284,7 @@ def main(args):
     print("STEP 1: 构建域间网络 (Docker + OVS)")
     print("=" * 40)
     run_cmd(
-        f"sudo python3 {DOMAIN_SCRIPT_OUT} --preset {args.inter_preset} --seed {args.inter_seed}"
+        f"sudo python3 {DOMAIN_SCRIPT_OUT} --preset {inter_preset} --seed {args.inter_seed}"
     )
 
     # 2. 部署域内网络
@@ -179,8 +292,8 @@ def main(args):
     print("STEP 2: 部署域内网络 (Mininet inside Docker)")
     print("=" * 40)
     intra_quiet = not args.intra_verbose
-    print(f"Inter preset: {args.inter_preset} (seed={args.inter_seed})")
-    print(f"Intra preset: {args.intra_preset} (seed base={args.intra_seed_base})")
+    print(f"Inter preset: {inter_preset} (seed={args.inter_seed})")
+    print(f"Intra preset: {intra_preset} (seed base={args.intra_seed_base})")
     print(
         f"Intra startup: quiet={intra_quiet} restart_after={args.intra_restart_after}s "
         f"max_retries={args.intra_max_retries} stagger={args.intra_start_stagger}s"
@@ -191,15 +304,20 @@ def main(args):
         os.makedirs("topo_data")
 
     # 移动域间数据
-    if os.path.exists("inter_domain_db.json"):
-        run_cmd("mv inter_domain_db.json topo_data/")
+    inter_db_runtime_path = "inter_domain_db.json"
+    inter_db_saved_path = "topo_data/inter_domain_db.json"
+    if os.path.exists(inter_db_runtime_path):
+        run_cmd(f"mv {inter_db_runtime_path} topo_data/")
+
+    container_names = resolve_container_list(inter_db_saved_path)
+    print(f"Detected domain containers: {', '.join(container_names)}")
 
     deploy_meta = {}
-    for i in range(1, NUM_CONTAINERS + 1):
-        container_name = f"docker{i}"
-        seed = args.intra_seed_base + i - 1
+    for container_name in container_names:
+        docker_id = _docker_sort_key(container_name)
+        seed = args.intra_seed_base + docker_id - 1
 
-        print(f"\n[Deploying {container_name}] Seed={seed}, DockerID={i}...")
+        print(f"\n[Deploying {container_name}] Seed={seed}, DockerID={docker_id}...")
 
         # 拷贝脚本
         run_cmd(
@@ -208,13 +326,13 @@ def main(args):
 
         # 后台运行 (传入 --id)
         if not restart_intra_agent(
-            container_name, seed, i, args.intra_preset, intra_quiet
+            container_name, seed, docker_id, intra_preset, intra_quiet
         ):
             print(f"Error executing topo_agent in {container_name}")
             sys.exit(1)
 
         print(f"  -> {container_name} started.")
-        deploy_meta[container_name] = {"seed": seed, "id": i}
+        deploy_meta[container_name] = {"seed": seed, "id": docker_id}
         if args.intra_start_stagger > 0:
             time.sleep(args.intra_start_stagger)
 
@@ -226,7 +344,7 @@ def main(args):
         f"开始主动检测拓扑就绪（超时 {TOPO_READY_TIMEOUT}s，轮询间隔 {TOPO_POLL_INTERVAL}s）..."
     )
 
-    pending = {f"docker{i}" for i in range(1, NUM_CONTAINERS + 1)}
+    pending = set(container_names)
     pending_start = {c: time.time() for c in pending}
     pending_retries = {c: 0 for c in pending}
     deadline = time.time() + TOPO_READY_TIMEOUT
@@ -259,7 +377,7 @@ def main(args):
                     f"(attempt {pending_retries[c_name]}/{args.intra_max_retries})"
                 )
                 ok = restart_intra_agent(
-                    c_name, meta["seed"], meta["id"], args.intra_preset, intra_quiet
+                    c_name, meta["seed"], meta["id"], intra_preset, intra_quiet
                 )
                 if ok:
                     pending_start[c_name] = time.time()
@@ -286,8 +404,14 @@ def main(args):
     print("DEPLOYMENT COMPLETE")
     print("=" * 40)
     print("所有网络已启动，拓扑数据已保存在 ./topo_data/ 目录下。")
-    print("通过 sudo python3 route_cal.py docker2:h1 docker5:h1 20 进行路由计算。")
-    print("通过 sudo python3 route_path.py docker2:h1 docker5:h1 20 进行路由部署。")
+    src_example = container_names[0] if container_names else "docker1"
+    dst_example = container_names[-1] if len(container_names) >= 2 else src_example
+    print(
+        f"通过 sudo python3 route_cal.py {src_example}:h1 {dst_example}:h1 20 进行路由计算。"
+    )
+    print(
+        f"通过 sudo python3 route_path.py {src_example}:h1 {dst_example}:h1 20 进行路由部署。"
+    )
 
 
 if __name__ == "__main__":

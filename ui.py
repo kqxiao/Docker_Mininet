@@ -40,12 +40,47 @@ DOMAIN_COLORS = {
     "docker4": "#F39C12",  # 橙色
     "docker5": "#9B59B6"  # 紫色
 }
+DOMAIN_COLOR_PALETTE = [
+    "#E74C3C", "#3498DB", "#2ECC71", "#F39C12", "#9B59B6",
+    "#1ABC9C", "#E67E22", "#34495E", "#16A085", "#D35400",
+    "#C0392B", "#7F8C8D",
+]
+_DYNAMIC_DOMAIN_COLORS = {}
 
 # 显示名称映射：将docker名称映射为中文子域名称
 DOMAIN_DISPLAY_NAMES = {
     "docker1": "domain1", "docker2": "domain2", "docker3": "domain3",
     "docker4": "domain4", "docker5": "domain5"
 }
+
+
+def _domain_sort_key(domain_name):
+    m = re.match(r"^docker(\d+)$", domain_name or "")
+    return int(m.group(1)) if m else 10 ** 9
+
+
+def _get_domain_color(domain_name):
+    if domain_name in DOMAIN_COLORS:
+        return DOMAIN_COLORS[domain_name]
+    if domain_name in _DYNAMIC_DOMAIN_COLORS:
+        return _DYNAMIC_DOMAIN_COLORS[domain_name]
+
+    idx = _domain_sort_key(domain_name) - 1
+    if idx >= 0:
+        color = DOMAIN_COLOR_PALETTE[idx % len(DOMAIN_COLOR_PALETTE)]
+    else:
+        color = DOMAIN_COLOR_PALETTE[len(_DYNAMIC_DOMAIN_COLORS) % len(DOMAIN_COLOR_PALETTE)]
+    _DYNAMIC_DOMAIN_COLORS[domain_name] = color
+    return color
+
+
+def _get_domain_display_name(domain_name):
+    if domain_name in DOMAIN_DISPLAY_NAMES:
+        return DOMAIN_DISPLAY_NAMES[domain_name]
+    m = re.match(r"^docker(\d+)$", domain_name or "")
+    if m:
+        return f"domain{m.group(1)}"
+    return domain_name
 
 # 业务流路径颜色池：用于区分不同业务流的路径高亮显示
 FLOW_COLORS = ["#FFFF00", "#FF00FF", "#00FFFF", "#FF6347", "#87CEFA", "#DDA0DD"]
@@ -1377,7 +1412,7 @@ class SDN_GUI(tk.Tk):
                     nodes_col = nx.draw_networkx_nodes(
                         nx.Graph(), pos, ax=self.ax,
                         nodelist=ns,
-                        node_color=DOMAIN_COLORS[domain],
+                        node_color=_get_domain_color(domain),
                         node_size=400,  # 主机较小
                         alpha=0.9,
                         edgecolors='#2c3e50', linewidths=2
@@ -1395,7 +1430,7 @@ class SDN_GUI(tk.Tk):
                     nodes_col = nx.draw_networkx_nodes(
                         nx.Graph(), pos, ax=self.ax,
                         nodelist=ns,
-                        node_color=DOMAIN_COLORS[domain],
+                        node_color=_get_domain_color(domain),
                         node_size=700,  # 交换机较大
                         alpha=1.0,
                         edgecolors='black', linewidths=2.5
@@ -1446,15 +1481,29 @@ class SDN_GUI(tk.Tk):
         # ===================== 绘制子域图例（右侧垂直排列） =====================
         y_start = 0.95
         y_step = 0.06
-        for i, domain in enumerate(['docker1', 'docker2', 'docker3', 'docker4', 'docker5']):
-            if any(n.startswith(domain) for n in nodes):
-                self.ax.text(0.98, y_start - i * y_step, DOMAIN_DISPLAY_NAMES[domain],
-                             transform=self.ax.transAxes,
-                             fontsize=12, fontweight='bold', ha='right', va='top',
-                             bbox=dict(boxstyle='round,pad=0.5',
-                                       facecolor=DOMAIN_COLORS[domain],
-                                       edgecolor='black', alpha=0.9, linewidth=2),
-                             zorder=20)
+        domains_in_graph = sorted(
+            {n.split('-')[0] for n in nodes if n.startswith("docker")},
+            key=_domain_sort_key
+        )
+        for i, domain in enumerate(domains_in_graph):
+            self.ax.text(
+                0.98,
+                y_start - i * y_step,
+                _get_domain_display_name(domain),
+                transform=self.ax.transAxes,
+                fontsize=12,
+                fontweight='bold',
+                ha='right',
+                va='top',
+                bbox=dict(
+                    boxstyle='round,pad=0.5',
+                    facecolor=_get_domain_color(domain),
+                    edgecolor='black',
+                    alpha=0.9,
+                    linewidth=2
+                ),
+                zorder=20
+            )
 
         # ===================== 添加图例（左上区域） =====================
         legend_elements = [
