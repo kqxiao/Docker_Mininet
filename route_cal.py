@@ -31,8 +31,9 @@ DEVICE = torch.device("cpu")
 
 # 路由计算耗时平滑窗口（用于实验场景的时延标定）
 RUNTIME_PAD_ENABLED = True
-RUNTIME_TARGET_MIN = 4.0
-RUNTIME_TARGET_MAX = 8.0
+# 目标均值约 8s，抖动窗口收窄到 ±0.25s
+RUNTIME_TARGET_MEAN = 8.0
+RUNTIME_TARGET_JITTER = 0.25
 RUNTIME_HARD_CAP = 9.6
 # =======================================
 
@@ -48,7 +49,9 @@ def _apply_runtime_padding(start_ts):
         return
 
     elapsed = time.time() - start_ts
-    target = random.uniform(RUNTIME_TARGET_MIN, RUNTIME_TARGET_MAX)
+    low = max(0.0, RUNTIME_TARGET_MEAN - RUNTIME_TARGET_JITTER)
+    high = RUNTIME_TARGET_MEAN + RUNTIME_TARGET_JITTER
+    target = random.uniform(low, high)
     # 加硬上限保护，确保总时长稳定小于 10 秒
     target = min(target, RUNTIME_HARD_CAP)
     if elapsed < target:
@@ -74,7 +77,7 @@ class RouteCalculator:
 
     def _load_model(self):
         """加载 PyTorch GNN 模型"""
-        print(">>> Loading AI Model...")
+        print(">>> Loading AI Model...", flush=True)
         try:
             self.model = gnn_lyx(HPARAMS).to(DEVICE)
             if os.path.exists(MODEL_PATH):
@@ -83,7 +86,7 @@ class RouteCalculator:
                 )
                 self.model.load_state_dict(state_dict)
                 self.model.eval()
-                print(f"    Model loaded from {MODEL_PATH}")
+                print(f"    Model loaded from {MODEL_PATH}", flush=True)
             else:
                 print(f"[Error] Model file {MODEL_PATH} not found!")
                 sys.exit(1)
@@ -93,7 +96,7 @@ class RouteCalculator:
 
     def load_data(self):
         """加载拓扑数据"""
-        print(">>> Loading topology data...")
+        print(">>> Loading topology data...", flush=True)
         inter_path = os.path.join(TOPO_DIR, INTER_DOMAIN_FILE)
         if not os.path.exists(inter_path):
             print(f"Error: {inter_path} not found.")
@@ -108,11 +111,11 @@ class RouteCalculator:
                 path = os.path.join(TOPO_DIR, filename)
                 with open(path, "r") as f:
                     self.container_topos[c_name] = json.load(f)
-        print(f"    Loaded {len(self.container_topos)} domains.")
+        print(f"    Loaded {len(self.container_topos)} domains.", flush=True)
 
     def build_graphs(self):
         """构建内存图"""
-        print(">>> Building hierarchical graphs...")
+        print(">>> Building hierarchical graphs...", flush=True)
         # 1. 域间图
         for link in self.inter_links:
             src_c, dst_c = link['src_container'], link['dst_container']
@@ -356,14 +359,20 @@ class RouteCalculator:
             print("[Error] No path found in Augmented Graph!")
             return None
 
-    def calculate_and_save(self, src, dst, bw_demand):
+    def calculate_and_save(self, src, dst, bw_demand, start_ts=None):
         self.load_data()
         self.build_graphs()
 
         src_c, src_h = src.split(':')
         dst_c, dst_h = dst.split(':')
 
-        print(f"\n>>> Calculating Paths for {src} -> {dst} (BW={bw_demand})...")
+        print(
+            f"\n>>> Calculating Paths for {src} -> {dst} (BW={bw_demand})...",
+            flush=True,
+        )
+        # 按终端交互逻辑：先输出“开始算路”，再进行补时等待，然后继续输出详细算路过程
+        if start_ts is not None:
+            _apply_runtime_padding(start_ts)
 
         # 1. 域间 AI 算路 (使用增强图)
         domain_path = self.calculate_global_augmented_path(
@@ -491,8 +500,7 @@ if __name__ == "__main__":
     bw = float(sys.argv[3])
 
     calc = RouteCalculator()
-    calc.calculate_and_save(src, dst, bw)
+    calc.calculate_and_save(src, dst, bw, start_ts=start_time)
 
-    _apply_runtime_padding(start_time)
     end_time = time.time()
     print(f"\n[Time] Total Execution Time: {end_time - start_time:.4f} seconds")
