@@ -1562,16 +1562,23 @@ class SDN_GUI(tk.Tk):
                      fontsize=10, fontweight='bold', va='top',
                      bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
 
-        # 设置坐标轴边界（留边距）
+        # 设置坐标轴边界。节点大小是按屏幕点数绘制的，若只按节点中心点取边界，
+        # 靠边的大网关/交换机圆和标签会被裁掉，因此这里按拓扑跨度留动态安全边距。
         xs = [x for x, y in pos.values()]
         ys = [y for x, y in pos.values()]
-        margin = 10
+        if xs and ys:
+            x_span = max(xs) - min(xs)
+            y_span = max(ys) - min(ys)
+            span = max(x_span, y_span, 1)
+            margin = max(80, span * 0.045)
+        else:
+            margin = 80
         self.ax.set_xlim(min(xs) - margin if xs else -70, max(xs) + margin if xs else 70)
         self.ax.set_ylim(min(ys) - margin if ys else -70, max(ys) + margin if ys else 70)
         self.ax.axis('off')  # 隐藏坐标轴
 
         # 调整布局并渲染
-        self.fig.tight_layout(pad=0.3)
+        self.fig.tight_layout(pad=0.45)
         self.canvas.draw()
 
     def _resolve_batch_file(self, filename):
