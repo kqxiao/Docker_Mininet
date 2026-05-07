@@ -406,11 +406,12 @@ def main(args):
     print("所有网络已启动，拓扑数据已保存在 ./topo_data/ 目录下。")
     src_example = container_names[0] if container_names else "docker1"
     dst_example = container_names[-1] if len(container_names) >= 2 else src_example
+    print("QoS 参数格式：带宽(Mbps) 最大端到端时延(ms) 最大端到端丢包率(%)。")
     print(
-        f"通过 sudo python3 route_cal.py {src_example}:h1 {dst_example}:h1 20 进行路由计算。"
+        f"通过 sudo python3 route_cal.py {src_example}:h1 {dst_example}:h1 20 120 5 进行路由计算。"
     )
     print(
-        f"通过 sudo python3 route_path.py {src_example}:h1 {dst_example}:h1 20 进行路由部署。"
+        f"通过 sudo python3 route_path.py {src_example}:h1 {dst_example}:h1 20 120 5 --index 0 进行路由部署。"
     )
 
 

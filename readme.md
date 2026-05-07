@@ -13,8 +13,8 @@
 - `model_epoch_20000.pth`：训练好的模型参数。
 
 ### 1.3 路由计算与下发
-- `route_cal.py`：按源/宿主机和带宽需求算路，输出候选路径到 `topo_path/*.json`。
-- `route_path.py`：读取候选路径并下发流表，同时更新剩余带宽；维护 `topo_data/active_flows.json` 活动业务状态。
+- `route_cal.py`：按源/宿主机和 QoS 需求算路，支持带宽、最大端到端时延、最大端到端丢包率，输出候选路径到 `topo_path/*.json`。
+- `route_path.py`：读取候选路径并下发流表，同时检查 QoS、更新剩余带宽；维护 `topo_data/active_flows.json` 活动业务状态。
 - `route_batch.py`：批量读取业务请求文件并依次执行算路+下发。
 
 ### 1.4 故障监测与自愈
@@ -32,7 +32,7 @@
 - `m` 脚本（需提前放到宿主机 PATH）：用于定位 Mininet 主机命名空间，支持 `docker exec <container> m <host> ...`。
 
 ### 1.7 运行时数据目录
-- `topo_data/`：拓扑数据库与剩余带宽状态（含 `active_flows.json`）。
+- `topo_data/`：拓扑数据库与链路 QoS 状态（`bw/delay/loss`，含 `active_flows.json`）。
 - `topo_path/`：算路生成的候选路径文件。
 - `test_traffic.txt`：批量业务请求样例文件。
 
@@ -149,15 +149,58 @@ sudo python3 master_deploy.py --inter-preset ring5 --intra-preset ring20 --intra
 
 
 ### 2.5 单条业务算路与下发（示例）
+旧格式仍兼容，只按带宽约束：
 ```bash
 sudo python3 route_cal.py docker2:h1 docker5:h1 20
 sudo python3 route_path.py docker2:h1 docker5:h1 20 --index 0
 ```
 
+新 QoS 格式：
+- 第 3 个参数：带宽需求，单位 Mbps。
+- 第 4 个参数：最大端到端时延，单位 ms。
+- 第 5 个参数：最大端到端丢包率，单位 `%`。
 
-### 2.6 批量业务（可选）
+```bash
+sudo python3 route_cal.py docker2:h1 docker5:h1 20 120 5
+sudo python3 route_path.py docker2:h1 docker5:h1 20 120 5 --index 0
+```
+
+算路结果文件会保存每条候选路径的实际指标：
+```json
+"metrics": {
+  "bw": 35.0,
+  "delay": 58.0,
+  "loss": 0.842
+}
+```
+
+### 2.6 QoS 指标计算说明
+链路 QoS 在生成拓扑时写入 JSON：
+- 域间链路：`bw` 随机 100-200 Mbps，`delay` 随机 5-20 ms，`loss` 随机 0.01%-0.30%。
+- 域内交换机链路：`bw` 随机 30-50 Mbps，`delay` 随机 1-8 ms，`loss` 随机 0.01%-0.50%。
+- 主机接入链路：`bw=1000 Mbps`，`delay=0 ms`，`loss=0%`。
+- Docker 外部接口接入域内交换机：`bw=1000 Mbps`，`delay=1 ms`，`loss=0%`。
+
+端到端路径指标按整条路径汇总：
+- 带宽 `BW`：取路径上所有链路剩余带宽的最小值，即瓶颈带宽。例如路径各链路剩余带宽为 `42/35/30/48 Mbps`，则路径 `BW=30 Mbps`。
+- 时延 `Delay`：把路径上所有链路时延相加。例如 `5ms + 8ms + 10ms = 23ms`。
+- 丢包率 `Loss`：按独立链路丢包概率合成，不是简单相加。公式为 `1 - ∏(1 - link_loss)`。代码中用百分比保存，例如 `0.2%` 和 `0.3%` 两条链路合成约为 `0.4994%`。
+
+部署业务后只扣减带宽：
+- 业务需求 `20 Mbps` 表示路径瓶颈带宽必须 `>=20 Mbps`。
+- 算路输出中的 `Metrics: BW=30.00Mbps` 表示该路径当前瓶颈剩余带宽是 `30 Mbps`，不是业务会占用 `30 Mbps`。
+- 执行 `route_path.py` 部署后，路径上经过的链路只扣业务需求带宽，例如瓶颈链路从 `30 Mbps` 变为 `10 Mbps`。
+- `delay/loss` 是链路质量属性，不随业务部署扣减，只参与路径筛选、排序和部署前校验。
+
+### 2.7 批量业务（可选）
 ```bash
 sudo python3 route_batch.py test_traffic.txt
+```
+
+批量文件支持两种格式：
+```text
+docker1:h1 docker5:h1 20
+docker1:h1 docker5:h1 20 120 5
 ```
 
 ## 3. 故障自愈联调命令（完整）
@@ -198,7 +241,7 @@ sudo docker ps --format '{{.Names}}'
 
 # 连通性测试（示例：docker2:h1 -> docker5:h1）
 sudo docker exec docker2 m h1 ping -c 3 -W 1 10.0.5.1
-
+```
 
 ### 3.5 结束与恢复环境
 ```bash

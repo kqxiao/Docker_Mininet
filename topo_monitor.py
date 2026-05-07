@@ -30,6 +30,15 @@ def _normalize_bw_str(bw):
     return f"{bw_f:.3f}".rstrip("0").rstrip(".")
 
 
+def _normalize_optional_num(value):
+    if value is None:
+        return None
+    value_f = float(value)
+    if value_f.is_integer():
+        return str(int(value_f))
+    return f"{value_f:.3f}".rstrip("0").rstrip(".")
+
+
 def _extract_exec_time(stdout_text):
     m = re.search(r"Total Execution Time:\s*([0-9.]+)\s*seconds", stdout_text or "")
     if m:
@@ -37,15 +46,22 @@ def _extract_exec_time(stdout_text):
     return None
 
 
-def _build_path_filename(src, dst, bw):
+def _build_path_filename(src, dst, bw, max_delay=None, max_loss=None):
     safe_src = src.replace(":", "_")
     safe_dst = dst.replace(":", "_")
     p1, p2 = sorted([safe_src, safe_dst])
-    return f"{p1}_{p2}_{int(float(bw))}.json"
+    suffix = _normalize_bw_str(bw)
+    if max_delay is not None:
+        suffix += f"_d{_normalize_optional_num(max_delay)}"
+    if max_loss is not None:
+        suffix += f"_l{_normalize_optional_num(max_loss)}"
+    return f"{p1}_{p2}_{suffix}.json"
 
 
-def _load_path_candidates(src, dst, bw):
-    path_file = os.path.join(PATH_DIR, _build_path_filename(src, dst, bw))
+def _load_path_candidates(src, dst, bw, max_delay=None, max_loss=None):
+    path_file = os.path.join(
+        PATH_DIR, _build_path_filename(src, dst, bw, max_delay, max_loss)
+    )
     if not os.path.exists(path_file):
         return []
     try:
@@ -76,27 +92,27 @@ def _candidate_to_display(cand):
     return " -> ".join(n.replace("docker", "domain") for n in cleaned)
 
 
-def _load_path_display(src, dst, bw, path_idx=0):
-    cands = _load_path_candidates(src, dst, bw)
+def _load_path_display(src, dst, bw, path_idx=0, max_delay=None, max_loss=None):
+    cands = _load_path_candidates(src, dst, bw, max_delay, max_loss)
     if path_idx < 0 or path_idx >= len(cands):
         return None
     return _candidate_to_display(cands[path_idx])
 
 
-def _load_best_path_display(src, dst, bw):
+def _load_best_path_display(src, dst, bw, max_delay=None, max_loss=None):
     """
     兼容旧调用：读取 rank=0 的路径展示。
     """
-    return _load_path_display(src, dst, bw, 0)
+    return _load_path_display(src, dst, bw, 0, max_delay, max_loss)
 
 
-def _is_route_cal_success(ok, out, src, dst, bw):
+def _is_route_cal_success(ok, out, src, dst, bw, max_delay=None, max_loss=None):
     if not ok:
         return False
     # route_cal.py 失败时有些场景返回码仍为 0，这里用结果文件兜底判断。
     if "Calculation Complete. Paths saved to:" in (out or ""):
         return True
-    return len(_load_path_candidates(src, dst, bw)) > 0
+    return len(_load_path_candidates(src, dst, bw, max_delay, max_loss)) > 0
 
 
 def _is_route_deploy_success(ok, out):
@@ -462,6 +478,8 @@ def reroute_flow(flow_record):
     src = flow_record.get("src")
     dst = flow_record.get("dst")
     bw = flow_record.get("bw")
+    max_delay = flow_record.get("max_delay")
+    max_loss = flow_record.get("max_loss")
     if not src or not dst or bw is None:
         return {
             "success": False,
@@ -473,7 +491,17 @@ def reroute_flow(flow_record):
         }
 
     bw_str = _normalize_bw_str(bw)
-    print(f"\n>>> Re-routing {src} -> {dst} (BW={bw_str} Mbps)")
+    qos_extra_args = []
+    qos_desc = f"BW={bw_str} Mbps"
+    if max_delay is not None:
+        delay_str = _normalize_optional_num(max_delay)
+        qos_extra_args.append(delay_str)
+        qos_desc += f", MaxDelay={delay_str} ms"
+    if max_loss is not None:
+        loss_str = _normalize_optional_num(max_loss)
+        qos_extra_args.append(loss_str)
+        qos_desc += f", MaxLoss={loss_str}%"
+    print(f"\n>>> Re-routing {src} -> {dst} ({qos_desc})")
 
     # 1) 优先尝试之前算出的冗余候选路径（不重新算路）
     route_meta = flow_record.get("route", {})
@@ -483,15 +511,17 @@ def reroute_flow(flow_record):
     except Exception:
         old_idx = 0
 
-    candidates = _load_path_candidates(src, dst, bw_str)
+    candidates = _load_path_candidates(src, dst, bw_str, max_delay, max_loss)
     backup_indices = [i for i in range(len(candidates)) if i != old_idx]
     if backup_indices:
         print(f"  Trying cached backup candidates: {backup_indices}")
 
     for idx in backup_indices:
         print(f"  [Backup] Try candidate index={idx}")
+        extra = " ".join(qos_extra_args)
+        extra = f" {extra}" if extra else ""
         cmd_deploy = _with_sudo(
-            f"python3 route_path.py {src} {dst} {bw_str} --index {idx}"
+            f"python3 route_path.py {src} {dst} {bw_str}{extra} --index {idx}"
         )
         t1 = time.time()
         ok, out = run_cmd(cmd_deploy)
@@ -500,7 +530,7 @@ def reroute_flow(flow_record):
             route_switch_time = time.time() - t1
 
         if _is_route_deploy_success(ok, out):
-            path_display = _load_path_display(src, dst, bw_str, idx)
+            path_display = _load_path_display(src, dst, bw_str, idx, max_delay, max_loss)
             print(f"  [OK] Backup route deployed for {src}->{dst} (index={idx})")
             if path_display:
                 print(f"  [REROUTE] Path: {path_display}")
@@ -526,13 +556,15 @@ def reroute_flow(flow_record):
         print("  [Backup] No cached candidate file found. Fallback to re-calc.")
 
     # 2) 兜底：重新算路并部署 rank=0
-    cmd_cal = _with_sudo(f"python3 route_cal.py {src} {dst} {bw_str}")
+    extra = " ".join(qos_extra_args)
+    extra = f" {extra}" if extra else ""
+    cmd_cal = _with_sudo(f"python3 route_cal.py {src} {dst} {bw_str}{extra}")
     t0 = time.time()
     ok, out = run_cmd(cmd_cal)
     route_gen_time = _extract_exec_time(out)
     if route_gen_time is None:
         route_gen_time = time.time() - t0
-    if not _is_route_cal_success(ok, out, src, dst, bw_str):
+    if not _is_route_cal_success(ok, out, src, dst, bw_str, max_delay, max_loss):
         print(f"  [Fail] route_cal failed for {src}->{dst}")
         if out:
             print(out.strip())
@@ -545,8 +577,8 @@ def reroute_flow(flow_record):
             "path_index": None,
         }
 
-    path_display = _load_path_display(src, dst, bw_str, 0)
-    cmd_deploy = _with_sudo(f"python3 route_path.py {src} {dst} {bw_str} --index 0")
+    path_display = _load_path_display(src, dst, bw_str, 0, max_delay, max_loss)
+    cmd_deploy = _with_sudo(f"python3 route_path.py {src} {dst} {bw_str}{extra} --index 0")
     t1 = time.time()
     ok, out = run_cmd(cmd_deploy)
     route_switch_time = _extract_exec_time(out)
@@ -610,8 +642,13 @@ def handle_failures_and_reroute(
 
     print(f"  Impacted active flows: {len(impacted)}")
     for flow_key, flow_record in impacted:
+        qos_desc = f"{flow_record.get('bw')} Mbps"
+        if flow_record.get("max_delay") is not None:
+            qos_desc += f", delay<={flow_record.get('max_delay')} ms"
+        if flow_record.get("max_loss") is not None:
+            qos_desc += f", loss<={flow_record.get('max_loss')}%"
         print(
-            f"    - {flow_record.get('src')} -> {flow_record.get('dst')} ({flow_record.get('bw')} Mbps)"
+            f"    - {flow_record.get('src')} -> {flow_record.get('dst')} ({qos_desc})"
         )
         release_flow_reservation(flow_record)
         active_flows.pop(flow_key, None)

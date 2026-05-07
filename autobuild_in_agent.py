@@ -232,7 +232,7 @@ def attach_external_links(net, G, nx_node_to_switch):
 def save_topology(net, docker_id, external_map, qos_data):
     """
     保存详细的拓扑信息 (含端口号和QoS信息) 到 JSON
-    qos_data: {(u, v): {'bw': 100}} 键为排序后的节点ID元组
+    qos_data: {(u, v): {'bw': 100, 'delay': 1, 'loss': 0.1}} 键为排序后的节点ID元组
 
     JSON 结构示例:
     topo_data = {
@@ -263,11 +263,21 @@ def save_topology(net, docker_id, external_map, qos_data):
             key = tuple(sorted((id1, id2)))
 
             # 获取QoS，如果找不到则用默认值
-            qos = qos_data.get(key, {'bw': 1000})
+            qos = qos_data.get(key, {'bw': 1000, 'delay': 1, 'loss': 0.0})
 
             # 存入字典结构
-            topo_data["switches"][n1.name][n2.name] = {"port": p1_name, "bw": qos['bw']}
-            topo_data["switches"][n2.name][n1.name] = {"port": p2_name, "bw": qos['bw']}
+            topo_data["switches"][n1.name][n2.name] = {
+                "port": p1_name,
+                "bw": qos['bw'],
+                "delay": qos.get('delay', 1),
+                "loss": qos.get('loss', 0.0),
+            }
+            topo_data["switches"][n2.name][n1.name] = {
+                "port": p2_name,
+                "bw": qos['bw'],
+                "delay": qos.get('delay', 1),
+                "loss": qos.get('loss', 0.0),
+            }
 
     # 2. 记录外部接口 (从 attach_external_links 返回的 map 获取)
     for sw_name, ifaces in external_map.items():
@@ -279,6 +289,8 @@ def save_topology(net, docker_id, external_map, qos_data):
             topo_data["switches"][sw_name][f"EXT_{iface}"] = {
                 "port": iface,
                 "bw": 1000,  # 1 Gbps
+                "delay": 1,
+                "loss": 0.0,
             }
 
     # 3. 记录主机及其连接
@@ -305,7 +317,12 @@ def save_topology(net, docker_id, external_map, qos_data):
             topo_data["switches"][sw_node.name] = {}
 
         # 主机连接也给予默认参数 (接入层)
-        topo_data["switches"][sw_node.name][h.name] = {"port": sw_intf.name, "bw": 1000}
+        topo_data["switches"][sw_node.name][h.name] = {
+            "port": sw_intf.name,
+            "bw": 1000,
+            "delay": 0,
+            "loss": 0.0,
+        }
 
     with open('/root/topo_db.json', 'w') as f:
         json.dump(topo_data, f, indent=4)
@@ -356,12 +373,18 @@ def build_switch_topo(seed, docker_id, preset_name="ba_core"):
         # 随机生成参数
         # 带宽: 30Mbps ~ 50Mbps
         bw = random.randint(30, 50)
+        # 时延: 1ms ~ 8ms；丢包率: 0.01% ~ 0.50%
+        delay = random.randint(1, 8)
+        loss = round(random.uniform(0.01, 0.50), 3)
 
         # 使用排序后的元组作为键，保证无向边的唯一性
         key = tuple(sorted((u, v)))
-        qos_data[key] = {'bw': bw}
+        qos_data[key] = {'bw': bw, 'delay': delay, 'loss': loss}
 
-        log(f"    [Link QoS] s{u+1}-s{v+1}: BW={bw}Mbps\n")
+        log(
+            f"    [Link QoS] s{u+1}-s{v+1}: "
+            f"BW={bw}Mbps, Delay={delay}ms, Loss={loss}%\n"
+        )
 
     log('*** Starting network\n')
     net.start()

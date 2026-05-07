@@ -17,6 +17,31 @@ ACTIVE_FLOW_FILE = os.path.join(TOPO_DIR, "active_flows.json")
 # =======================================
 
 
+def _normalize_num(value):
+    value_f = float(value)
+    if value_f.is_integer():
+        return str(int(value_f))
+    return f"{value_f:.3f}".rstrip("0").rstrip(".")
+
+
+def build_path_filename(src, dst, bw, max_delay=None, max_loss=None):
+    safe_src = src.replace(':', '_')
+    safe_dst = dst.replace(':', '_')
+    p1, p2 = sorted([safe_src, safe_dst])
+    suffix = _normalize_num(bw)
+    if max_delay is not None:
+        suffix += f"_d{_normalize_num(max_delay)}"
+    if max_loss is not None:
+        suffix += f"_l{_normalize_num(max_loss)}"
+    return f"{p1}_{p2}_{suffix}.json"
+
+
+def combine_loss_pct(current_loss, link_loss):
+    current = min(max(float(current_loss), 0.0), 100.0) / 100.0
+    link = min(max(float(link_loss), 0.0), 100.0) / 100.0
+    return (1.0 - (1.0 - current) * (1.0 - link)) * 100.0
+
+
 def run_cmd(cmd):
     """执行命令并打印，自动忽略 'File exists' 错误"""
     try:
@@ -54,15 +79,14 @@ class RouteDeployer:
                 with open(path, "r") as f:
                     self.container_topos[c_name] = json.load(f)
 
-    def _normalize_bw_str(self, bw):
-        bw_f = float(bw)
-        if bw_f.is_integer():
-            return str(int(bw_f))
-        return f"{bw_f:.3f}".rstrip("0").rstrip(".")
-
-    def _flow_key(self, src, dst, bw):
+    def _flow_key(self, src, dst, bw, max_delay=None, max_loss=None):
         p1, p2 = sorted([src, dst])
-        return f"{p1}|{p2}|{self._normalize_bw_str(bw)}"
+        key = f"{p1}|{p2}|{_normalize_num(bw)}"
+        if max_delay is not None:
+            key += f"|d{_normalize_num(max_delay)}"
+        if max_loss is not None:
+            key += f"|l{_normalize_num(max_loss)}"
+        return key
 
     def _load_active_flows(self):
         if not os.path.exists(ACTIVE_FLOW_FILE):
@@ -152,6 +176,51 @@ class RouteDeployer:
             ):
                 return link['dst_iface']
         return None
+
+    def _path_metrics(self, c_name, path):
+        topo = self.container_topos.get(c_name, {})
+        switches = topo.get('switches', {})
+        metrics = {"bw": float("inf"), "delay": 0.0, "loss": 0.0}
+        for i in range(len(path) - 1):
+            u, v = path[i], path[i + 1]
+            if not (u.startswith('s') and v.startswith('s')):
+                continue
+            info = switches.get(u, {}).get(v)
+            if not isinstance(info, dict):
+                continue
+            metrics["bw"] = min(metrics["bw"], float(info.get("bw", 0)))
+            metrics["delay"] += float(info.get("delay", 1))
+            metrics["loss"] = combine_loss_pct(metrics["loss"], info.get("loss", 0.0))
+        if metrics["bw"] == float("inf"):
+            metrics["bw"] = 0.0
+        return metrics
+
+    def _inter_path_metrics(self, inter_path):
+        metrics = {"bw": float("inf"), "delay": 0.0, "loss": 0.0}
+        for i in range(len(inter_path) - 1):
+            u, v = inter_path[i], inter_path[i + 1]
+            idx = self._find_inter_link_idx(u, v)
+            if idx == -1:
+                continue
+            qos = self.inter_links[idx].get('qos', {})
+            metrics["bw"] = min(metrics["bw"], float(qos.get("bw", 0)))
+            metrics["delay"] += float(qos.get("delay", 10))
+            metrics["loss"] = combine_loss_pct(metrics["loss"], qos.get("loss", 0.0))
+        if metrics["bw"] == float("inf"):
+            metrics["bw"] = 0.0
+        return metrics
+
+    def _end_to_end_metrics(self, segments, inter_path):
+        metrics = self._inter_path_metrics(inter_path)
+        for seg in segments:
+            seg_metrics = self._path_metrics(seg.get('container'), seg.get('path', []))
+            if seg_metrics["bw"] > 0:
+                metrics["bw"] = min(metrics["bw"], seg_metrics["bw"])
+            metrics["delay"] += seg_metrics["delay"]
+            metrics["loss"] = combine_loss_pct(metrics["loss"], seg_metrics["loss"])
+        if metrics["bw"] == float("inf"):
+            metrics["bw"] = 0.0
+        return metrics
 
     def invert_segments(self, segments):
         """
@@ -296,6 +365,8 @@ class RouteDeployer:
         src,
         dst,
         bw_demand,
+        max_delay,
+        max_loss,
         route_data,
         path_idx,
         deployed_inter_path,
@@ -306,6 +377,9 @@ class RouteDeployer:
             "src": src,
             "dst": dst,
             "bw": float(bw_demand),
+            "max_delay": max_delay,
+            "max_loss": max_loss,
+            "metrics": copy.deepcopy(route_data.get('metrics', {})),
             "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "route": {
                 "path_index": path_idx,
@@ -317,9 +391,15 @@ class RouteDeployer:
         self._save_active_flows()
         print(f"    Active flow state updated: {ACTIVE_FLOW_FILE}")
 
-    def check_bandwidth_availability(self, segments, inter_path, required_bw):
-        """部署前检查带宽"""
-        print(f"  Checking bandwidth availability (Need {required_bw} Mbps)...")
+    def check_qos_availability(
+        self, segments, inter_path, required_bw, max_delay=None, max_loss=None
+    ):
+        """部署前检查带宽、时延和丢包率。"""
+        print(
+            f"  Checking QoS availability "
+            f"(BW>={required_bw} Mbps, Delay<={max_delay if max_delay is not None else 'N/A'} ms, "
+            f"Loss<={max_loss if max_loss is not None else 'N/A'}%)..."
+        )
         # 1. 域间
         for i in range(len(inter_path) - 1):
             u, v = inter_path[i], inter_path[i + 1]
@@ -341,7 +421,20 @@ class RouteDeployer:
                         if topo['switches'][u][v]['bw'] < required_bw:
                             print(f"    [Fail] {c_name} {u}-{v} BW insufficient.")
                             return False
-        print("    [Pass] Bandwidth check passed.")
+
+        metrics = self._end_to_end_metrics(segments, inter_path)
+        print(
+            f"    Current path metrics: BW={metrics['bw']:.2f}Mbps, "
+            f"Delay={metrics['delay']:.2f}ms, Loss={metrics['loss']:.3f}%"
+        )
+        if max_delay is not None and metrics['delay'] > max_delay:
+            print("    [Fail] End-to-end delay exceeds requirement.")
+            return False
+        if max_loss is not None and metrics['loss'] > max_loss:
+            print("    [Fail] End-to-end loss exceeds requirement.")
+            return False
+
+        print("    [Pass] QoS check passed.")
         return True
 
     def update_topology_files(self, segments, inter_path, required_bw):
@@ -422,18 +515,17 @@ class RouteDeployer:
                 )
         self._run_docker_batch(c_name, cmd_list)
 
-    def deploy_path(self, src, dst, bw_demand, path_idx=0):
+    def deploy_path(self, src, dst, bw_demand, path_idx=0, max_delay=None, max_loss=None):
         # 1. 读取保存的路径 (按排序后的文件名查找)
-        safe_src = src.replace(':', '_')
-        safe_dst = dst.replace(':', '_')
-        p1, p2 = sorted([safe_src, safe_dst])
-        filename = f"{p1}_{p2}_{int(bw_demand)}.json"
+        filename = build_path_filename(src, dst, bw_demand, max_delay, max_loss)
 
         load_path = os.path.join(PATH_SAVE_DIR, filename)
         if not os.path.exists(load_path):
             print(f"[Error] Path file not found: {load_path}")
             print(
-                f"Please run 'sudo python3 route_cal.py {src} {dst} {bw_demand}' first."
+                f"Please run 'sudo python3 route_cal.py {src} {dst} {bw_demand}"
+                f"{' ' + str(max_delay) if max_delay is not None else ''}"
+                f"{' ' + str(max_loss) if max_loss is not None else ''}' first."
             )
             sys.exit(1)
 
@@ -449,6 +541,12 @@ class RouteDeployer:
             f"\n>>> Deploying Route (Rank {path_idx}, Score={route_data['score']:.2f})"
         )
         print(f"    Inter-Domain: {'->'.join(route_data['inter_domain_path'])}")
+        metrics = route_data.get('metrics', {})
+        if metrics:
+            print(
+                f"    Metrics: BW={metrics.get('bw', 0):.2f}Mbps, "
+                f"Delay={metrics.get('delay', 0):.2f}ms, Loss={metrics.get('loss', 0):.3f}%"
+            )
 
         # 2. 准备 IP/MAC 信息
         src_c, src_h = src.split(':')
@@ -457,14 +555,18 @@ class RouteDeployer:
         dst_info = self.container_topos[dst_c]['hosts'][dst_h]
 
         # 3. 若是同一业务重部署：先释放旧占用并清旧规则
-        flow_key = self._flow_key(src, dst, bw_demand)
+        flow_key = self._flow_key(src, dst, bw_demand, max_delay, max_loss)
         self._replace_existing_flow_if_needed(flow_key, src_info['mac'], dst_info['mac'])
 
-        # 4. 检查带宽
-        if not self.check_bandwidth_availability(
-            route_data['segments'], route_data['inter_domain_path'], bw_demand
+        # 4. 检查 QoS
+        if not self.check_qos_availability(
+            route_data['segments'],
+            route_data['inter_domain_path'],
+            bw_demand,
+            max_delay,
+            max_loss,
         ):
-            print("\n[Error] Bandwidth check failed.")
+            print("\n[Error] QoS check failed.")
             return
 
         # 5. 识别方向
@@ -524,6 +626,8 @@ class RouteDeployer:
             src,
             dst,
             bw_demand,
+            max_delay,
+            max_loss,
             route_data,
             path_idx,
             deployed_inter_path,
@@ -542,13 +646,34 @@ if __name__ == "__main__":
     parser.add_argument("dst", help="Destination node")
     parser.add_argument("bw", type=float, help="Bandwidth demand")
     parser.add_argument(
+        "max_delay",
+        type=float,
+        nargs="?",
+        default=None,
+        help="Optional end-to-end max delay in ms",
+    )
+    parser.add_argument(
+        "max_loss",
+        type=float,
+        nargs="?",
+        default=None,
+        help="Optional end-to-end max packet loss in percent",
+    )
+    parser.add_argument(
         "--index", type=int, default=0, help="Path rank index to deploy (default 0)"
     )
 
     args = parser.parse_args()
 
     deployer = RouteDeployer()
-    deployer.deploy_path(args.src, args.dst, args.bw, args.index)
+    deployer.deploy_path(
+        args.src,
+        args.dst,
+        args.bw,
+        args.index,
+        max_delay=args.max_delay,
+        max_loss=args.max_loss,
+    )
 
     # 计算并打印结束时间
     end_time = time.time()

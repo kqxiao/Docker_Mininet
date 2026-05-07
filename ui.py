@@ -27,7 +27,7 @@ import matplotlib.patches as mpatches
 import numpy as np
 
 # ===================== 全局配置常量 =====================
-BASE_DIR = os.path.dirname(__file__)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TOPO_DATA_DIR = os.path.join(BASE_DIR, "topo_data")
 TOPO_PATH_DIR = os.path.join(BASE_DIR, "topo_path")
 INTER_DOMAIN_JSON = "inter_domain_db.json"  # 域间连接配置文件
@@ -192,7 +192,7 @@ def call_backend_script(script_name, src, dst, qos, extra_args=None):
         script_name: 脚本名（如route_cal.py）
         src: 源节点（格式：docker2:h1）
         dst: 目的节点（格式：docker5:h1）
-        qos: QoS值（整数）
+        qos: 带宽需求（Mbps）
 
     Returns:
         str: 后端脚本标准输出
@@ -228,21 +228,33 @@ def call_backend_script(script_name, src, dst, qos, extra_args=None):
         raise Exception(f"调用后端失败：{str(e)}")
 
 
-def build_path_filename(src, dst, qos):
+def _normalize_qos_num(value):
+    value_f = float(value)
+    if value_f.is_integer():
+        return str(int(value_f))
+    return f"{value_f:.3f}".rstrip("0").rstrip(".")
+
+
+def build_path_filename(src, dst, qos, max_delay=None, max_loss=None):
     """
     route_cal.py 保存路径文件的命名规则。
     """
     safe_src = src.replace(':', '_')
     safe_dst = dst.replace(':', '_')
     p1, p2 = sorted([safe_src, safe_dst])
-    return f"{p1}_{p2}_{int(float(qos))}.json"
+    suffix = _normalize_qos_num(qos)
+    if max_delay is not None:
+        suffix += f"_d{_normalize_qos_num(max_delay)}"
+    if max_loss is not None:
+        suffix += f"_l{_normalize_qos_num(max_loss)}"
+    return f"{p1}_{p2}_{suffix}.json"
 
 
-def load_route_candidates(src, dst, qos):
+def load_route_candidates(src, dst, qos, max_delay=None, max_loss=None):
     """
     从 topo_path 读取 route_cal.py 生成的候选路径。
     """
-    filename = build_path_filename(src, dst, qos)
+    filename = build_path_filename(src, dst, qos, max_delay, max_loss)
     path = os.path.join(TOPO_PATH_DIR, filename)
     if not os.path.exists(path):
         raise FileNotFoundError(f"未找到路径文件: {path}")
@@ -676,6 +688,13 @@ class SDN_GUI(tk.Tk):
             except Exception:
                 p_show = "(path parse failed)"
             lines.append(f"  [{idx}] Score={score:.2f}")
+            metrics = item.get("metrics", {}) if isinstance(item, dict) else {}
+            if metrics:
+                lines.append(
+                    f"      BW={metrics.get('bw', 0):.2f}Mbps | "
+                    f"Delay={metrics.get('delay', 0):.2f}ms | "
+                    f"Loss={metrics.get('loss', 0):.3f}%"
+                )
             lines.append(f"      Path: {p_show}")
         return lines
 
@@ -1590,7 +1609,7 @@ class SDN_GUI(tk.Tk):
     def _parse_batch_requests(self, file_path):
         """
         解析批量业务文件。
-        每行格式：src dst qos
+        每行格式：src dst bw [max_delay_ms max_loss_pct]
         """
         requests = []
         with open(file_path, "r", encoding="utf-8") as f:
@@ -1601,7 +1620,10 @@ class SDN_GUI(tk.Tk):
                 parts = line.split()
                 if len(parts) < 3:
                     requests.append(
-                        {"line_no": line_no, "error": f"格式错误（需要 src dst qos）: {line}"}
+                        {
+                            "line_no": line_no,
+                            "error": f"格式错误（需要 src dst bw [max_delay_ms max_loss_pct]）: {line}",
+                        }
                     )
                     continue
                 requests.append(
@@ -1610,11 +1632,15 @@ class SDN_GUI(tk.Tk):
                         "src": parts[0],
                         "dst": parts[1],
                         "qos": parts[2],
+                        "max_delay": parts[3] if len(parts) >= 4 else None,
+                        "max_loss": parts[4] if len(parts) >= 5 else None,
                     }
                 )
         return requests
 
-    def _store_flow_record(self, src_show, dst_show, qos, optimal_path, alternative_paths):
+    def _store_flow_record(
+        self, src_show, dst_show, qos, optimal_path, alternative_paths, max_delay=None, max_loss=None
+    ):
         """
         保存业务流到前端内存并分配颜色。
         """
@@ -1624,6 +1650,8 @@ class SDN_GUI(tk.Tk):
             "src": src_show,
             "dst": dst_show,
             "qos": qos,
+            "max_delay": max_delay,
+            "max_loss": max_loss,
             "path": optimal_path,
             "alternative_paths": alternative_paths,
         }
@@ -1683,10 +1711,19 @@ class SDN_GUI(tk.Tk):
                     src_raw = item["src"]
                     dst_raw = item["dst"]
                     qos_raw = item["qos"]
+                    max_delay_raw = item.get("max_delay")
+                    max_loss_raw = item.get("max_loss")
                     try:
                         qos = float(qos_raw)
                         if qos <= 0:
                             raise ValueError("QoS必须大于0")
+                        max_delay = float(max_delay_raw) if max_delay_raw is not None else None
+                        max_loss = float(max_loss_raw) if max_loss_raw is not None else None
+                        extra_qos_args = []
+                        if max_delay is not None:
+                            extra_qos_args.append(max_delay)
+                        if max_loss is not None:
+                            extra_qos_args.append(max_loss)
 
                         src = self._normalize_endpoint(src_raw)
                         dst = self._normalize_endpoint(dst_raw)
@@ -1694,12 +1731,14 @@ class SDN_GUI(tk.Tk):
                         dst_show = dst.replace("docker", "domain").replace(":", "-")
 
                         t0 = time.time()
-                        route_stdout = call_backend_script("route_cal.py", src, dst, qos)
+                        route_stdout = call_backend_script(
+                            "route_cal.py", src, dst, qos, extra_args=extra_qos_args
+                        )
                         route_cost = extract_exec_time(route_stdout)
                         if route_cost is None:
                             route_cost = round(time.time() - t0, 4)
 
-                        route_result = load_route_candidates(src, dst, qos)
+                        route_result = load_route_candidates(src, dst, qos, max_delay, max_loss)
                         optimal_path_data = route_result[0]
                         optimal_path = parse_backend_path(
                             optimal_path_data, self.inter_domain_edges
@@ -1710,22 +1749,35 @@ class SDN_GUI(tk.Tk):
 
                         t1 = time.time()
                         deploy_stdout = call_backend_script(
-                            "route_path.py", src, dst, qos, extra_args=["--index", "0"]
+                            "route_path.py",
+                            src,
+                            dst,
+                            qos,
+                            extra_args=extra_qos_args + ["--index", "0"],
                         )
                         deploy_cost = extract_exec_time(deploy_stdout)
                         if deploy_cost is None:
                             deploy_cost = round(time.time() - t1, 4)
 
                         fid = self._store_flow_record(
-                            src_show, dst_show, qos, optimal_path, alternative_paths
+                            src_show,
+                            dst_show,
+                            qos,
+                            optimal_path,
+                            alternative_paths,
+                            max_delay,
+                            max_loss,
                         )
                         path_display = " -> ".join(
                             p.replace("docker", "domain") for p in optimal_path
                         )
 
-                        self._log_terminal(
-                            f"[{fid}] {src_show} -> {dst_show} | QoS:{qos:g}\n"
-                        )
+                        qos_desc = f"BW:{qos:g}Mbps"
+                        if max_delay is not None:
+                            qos_desc += f" Delay<={max_delay:g}ms"
+                        if max_loss is not None:
+                            qos_desc += f" Loss<={max_loss:g}%"
+                        self._log_terminal(f"[{fid}] {src_show} -> {dst_show} | {qos_desc}\n")
                         self._log_terminal(f"    Path: {path_display}\n")
                         self._log_terminal(
                             f"    route_gen={route_cost:.4f}s | route_switch={deploy_cost:.4f}s\n"
@@ -1786,7 +1838,7 @@ class SDN_GUI(tk.Tk):
         """
         win = tk.Toplevel(self)
         win.title("新增业务流")
-        win.geometry("520x320")
+        win.geometry("520x410")
 
         # 源节点输入（支持domainX-hX格式，自动转换为dockerX-hX）
         tk.Label(win, text="源节点 (格式: domain1-h1 / docker1:h1):", font=('Microsoft YaHei', 11)).pack(anchor='w', padx=10, pady=3)
@@ -1800,11 +1852,21 @@ class SDN_GUI(tk.Tk):
         edst.pack(fill=tk.X, padx=10)
         edst.insert(0, "domain5-h1")
 
-        # QoS值输入
-        tk.Label(win, text="QoS值 (整数):", font=('Microsoft YaHei', 11)).pack(anchor='w', padx=10, pady=3)
+        # QoS输入
+        tk.Label(win, text="带宽需求 Mbps:", font=('Microsoft YaHei', 11)).pack(anchor='w', padx=10, pady=3)
         eqos = tk.Entry(win, font=('Consolas', 10))
         eqos.pack(fill=tk.X, padx=10)
         eqos.insert(0, "20")  # 默认值
+
+        tk.Label(win, text="最大端到端时延 ms（可空）:", font=('Microsoft YaHei', 11)).pack(anchor='w', padx=10, pady=3)
+        edelay = tk.Entry(win, font=('Consolas', 10))
+        edelay.pack(fill=tk.X, padx=10)
+        edelay.insert(0, "120")
+
+        tk.Label(win, text="最大端到端丢包率 %（可空）:", font=('Microsoft YaHei', 11)).pack(anchor='w', padx=10, pady=3)
+        eloss = tk.Entry(win, font=('Consolas', 10))
+        eloss.pack(fill=tk.X, padx=10)
+        eloss.insert(0, "2")
 
         # 结果显示标签
         result_var = tk.StringVar(value="等待输入...")
@@ -1815,29 +1877,45 @@ class SDN_GUI(tk.Tk):
             try:
                 src_ui = esrc.get().strip()
                 dst_ui = edst.get().strip()
-                qos = int(eqos.get().strip())
-                if qos < 0:
-                    raise Exception("QoS值不能为负数")
+                qos = float(eqos.get().strip())
+                if qos <= 0:
+                    raise Exception("带宽需求必须大于0")
+                max_delay = float(edelay.get().strip()) if edelay.get().strip() else None
+                max_loss = float(eloss.get().strip()) if eloss.get().strip() else None
+                extra_qos_args = []
+                if max_delay is not None:
+                    extra_qos_args.append(max_delay)
+                if max_loss is not None:
+                    extra_qos_args.append(max_loss)
 
                 src = self._normalize_endpoint(src_ui)
                 dst = self._normalize_endpoint(dst_ui)
                 src_show = src.replace("docker", "domain").replace(":", "-")
                 dst_show = dst.replace("docker", "domain").replace(":", "-")
 
-                self._log_terminal(f"\n>>> [ADD FLOW] {src_show} -> {dst_show} | QoS={qos}\n")
+                qos_desc = f"BW={qos:g}Mbps"
+                if max_delay is not None:
+                    qos_desc += f", Delay<={max_delay:g}ms"
+                if max_loss is not None:
+                    qos_desc += f", Loss<={max_loss:g}%"
+                self._log_terminal(f"\n>>> [ADD FLOW] {src_show} -> {dst_show} | {qos_desc}\n")
 
                 result_var.set("正在调用route_cal.py计算路由...")
                 win.update()  # 刷新界面显示状态
-                self._log_terminal(f"$ {self._display_python_cmd('route_cal.py', [src, dst, qos])}\n")
+                self._log_terminal(
+                    f"$ {self._display_python_cmd('route_cal.py', [src, dst, qos] + extra_qos_args)}\n"
+                )
                 t0 = time.time()
-                route_stdout = call_backend_script("route_cal.py", src, dst, qos)
+                route_stdout = call_backend_script(
+                    "route_cal.py", src, dst, qos, extra_args=extra_qos_args
+                )
                 route_cost = extract_exec_time(route_stdout)
                 if route_cost is None:
                     route_cost = round(time.time() - t0, 4)
                 self.route_gen_time.set(f"{route_cost:.4f}")
 
                 # route_cal.py 的结果在 topo_path 文件中
-                route_result = load_route_candidates(src, dst, qos)
+                route_result = load_route_candidates(src, dst, qos, max_delay, max_loss)
                 self._log_terminal("Candidates (Top 5):\n")
                 for line in self._candidate_path_lines(route_result, max_count=5):
                     self._log_terminal(line + "\n")
@@ -1845,10 +1923,16 @@ class SDN_GUI(tk.Tk):
                 # 再调用路径部署脚本
                 result_var.set("正在调用route_path.py部署路径...")
                 win.update()
-                self._log_terminal(f"$ {self._display_python_cmd('route_path.py', [src, dst, qos, '--index', 0])}\n")
+                self._log_terminal(
+                    f"$ {self._display_python_cmd('route_path.py', [src, dst, qos] + extra_qos_args + ['--index', 0])}\n"
+                )
                 t1 = time.time()
                 deploy_stdout = call_backend_script(
-                    "route_path.py", src, dst, qos, extra_args=["--index", "0"]
+                    "route_path.py",
+                    src,
+                    dst,
+                    qos,
+                    extra_args=extra_qos_args + ["--index", "0"],
                 )
                 deploy_cost = extract_exec_time(deploy_stdout)
                 if deploy_cost is None:
@@ -1873,6 +1957,8 @@ class SDN_GUI(tk.Tk):
                     'src': src_show,
                     'dst': dst_show,
                     'qos': qos,
+                    'max_delay': max_delay,
+                    'max_loss': max_loss,
                     'path': optimal_path,  # 最优路径（可视化用）
                     'alternative_paths': alternative_paths  # 备选路径（仅展示）
                 }
@@ -1883,7 +1969,14 @@ class SDN_GUI(tk.Tk):
                     f"算路:{route_cost:.4f}s, 部署:{deploy_cost:.4f}s")
                 path_display = [p.replace('docker', 'domain') for p in optimal_path]
                 score = float(optimal_path_data.get("score", 0))
+                metrics = optimal_path_data.get("metrics", {})
                 self._log_terminal(f"Deploy Route: [0] Score={score:.2f}\n")
+                if metrics:
+                    self._log_terminal(
+                        f"Metrics: BW={metrics.get('bw', 0):.2f}Mbps | "
+                        f"Delay={metrics.get('delay', 0):.2f}ms | "
+                        f"Loss={metrics.get('loss', 0):.3f}%\n"
+                    )
                 self._log_terminal(f"[{fid}] PATH: {' -> '.join(path_display)}\n")
                 bw_lines = self._deploy_bw_lines(deploy_stdout)
                 if bw_lines:
@@ -1897,7 +1990,7 @@ class SDN_GUI(tk.Tk):
 
             except ValueError as e:
                 if "invalid literal" in str(e):
-                    result_var.set("错误: QoS值必须为整数")
+                    result_var.set("错误: QoS值必须是数字")
                 else:
                     result_var.set(f"错误: {str(e)}")
             except Exception as e:

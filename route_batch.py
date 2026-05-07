@@ -40,17 +40,26 @@ def process_batch_file(filepath):
             line_num += 1
             parts = line.split()
             
-            # 格式检查: src dst bw
+            # 格式检查: src dst bw [max_delay_ms max_loss_pct]
             if len(parts) < 3:
-                print(f"\n[Skipping] Line {line_num}: Format error (expected: src dst bw)")
+                print(
+                    f"\n[Skipping] Line {line_num}: Format error "
+                    f"(expected: src dst bw [max_delay_ms max_loss_pct])"
+                )
                 continue
 
             src, dst, bw_str = parts[0], parts[1], parts[2]
+            qos_args = parts[3:5]
+            qos_desc = f"BW={bw_str}Mbps"
+            if len(qos_args) >= 2:
+                qos_desc += f", MaxDelay={qos_args[0]}ms, MaxLoss={qos_args[1]}%"
             
-            print(f"\n>>> [Flow {line_num}] Processing request: {src} -> {dst} (BW={bw_str}Mbps)")
+            print(f"\n>>> [Flow {line_num}] Processing request: {src} -> {dst} ({qos_desc})")
             
             # 1. 计算路径 (Route Calculation)
-            cmd_cal = f"sudo python3 route_cal.py {src} {dst} {bw_str}"
+            extra = " ".join(qos_args)
+            extra = f" {extra}" if extra else ""
+            cmd_cal = f"sudo python3 route_cal.py {src} {dst} {bw_str}{extra}"
             if not run_command(cmd_cal):
                 print(f"    [Fail] Calculation failed for Flow {line_num}")
                 fail_count += 1
@@ -58,7 +67,7 @@ def process_batch_file(filepath):
 
             # 2. 部署路径 (Route Deployment)
             # 默认使用 index 0 (最优路径)
-            cmd_path = f"sudo python3 route_path.py {src} {dst} {bw_str} --index 0"
+            cmd_path = f"sudo python3 route_path.py {src} {dst} {bw_str}{extra} --index 0"
             if run_command(cmd_path):
                 print(f"    [Success] Flow {line_num} Deployed.")
                 success_count += 1
@@ -85,4 +94,3 @@ if __name__ == "__main__":
     start_time = time.time()
     process_batch_file(sys.argv[1])
     print(f"[Total Time] {time.time() - start_time:.2f} seconds")
-

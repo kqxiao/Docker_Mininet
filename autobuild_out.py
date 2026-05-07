@@ -133,9 +133,12 @@ def main(preset_name="ba_core", seed=1):
         node_eth_counter[u] += 1
         node_eth_counter[v] += 1
 
-        # === 随机生成 QoS 参数 (仅带宽) ===
+        # === 随机生成 QoS 参数 ===
         # 带宽: 100Mbps ~ 200Mbps (域间通常比域内快)
         bw = random.randint(100, 200)
+        # 时延: 5ms ~ 20ms；丢包率: 0.01% ~ 0.30%
+        delay = random.randint(5, 20)
+        loss = round(random.uniform(0.01, 0.30), 3)
 
         # 记录拓扑关系及QoS
         inter_domain_links.append(
@@ -144,7 +147,7 @@ def main(preset_name="ba_core", seed=1):
                 "src_iface": eth_u,
                 "dst_container": c_v,
                 "dst_iface": eth_v,
-                "qos": {"bw": bw},
+                "qos": {"bw": bw, "delay": delay, "loss": loss},
             }
         )
 
@@ -158,7 +161,8 @@ def main(preset_name="ba_core", seed=1):
         current_ofport += 1
 
         print(
-            f"    Link: {c_u}:{eth_u}(Port {port_u}) <--> {c_v}:{eth_v}(Port {port_v}) [BW={bw}Mbps]"
+            f"    Link: {c_u}:{eth_u}(Port {port_u}) <--> {c_v}:{eth_v}(Port {port_v}) "
+            f"[BW={bw}Mbps, Delay={delay}ms, Loss={loss}%]"
         )
 
         # 下发底层静态路由 (直连)
