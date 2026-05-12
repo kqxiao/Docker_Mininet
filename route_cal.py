@@ -8,6 +8,7 @@ import os
 import torch
 import time
 import argparse
+from itertools import product
 
 # 引入基础模块
 from gnn_lyx import gnn_lyx
@@ -236,6 +237,243 @@ class RouteCalculator:
             return False
         return True
 
+    def _path_to_display(self, path):
+        return " -> ".join(n.replace("docker", "d") for n in path)
+
+    def _gnn_path_to_flat(self, route_data):
+        flat_path = []
+        for seg in route_data.get("segments", []):
+            c_name = seg.get("container")
+            for node in seg.get("path", []):
+                item = f"{c_name}:{node}"
+                if not flat_path or flat_path[-1] != item:
+                    flat_path.append(item)
+        return flat_path
+
+    def _valid_local_graph(self, graph, bw_demand):
+        valid_g = nx.DiGraph()
+        for u, v, data in graph.edges(data=True):
+            if float(data.get("bw", 0)) >= bw_demand:
+                valid_g.add_edge(u, v, **data)
+        return valid_g
+
+    def _local_path_candidates(self, graph, src, dst, bw_demand, objective, limit=8):
+        valid_g = self._valid_local_graph(graph, bw_demand)
+        if src not in valid_g or dst not in valid_g or not nx.has_path(valid_g, src, dst):
+            return []
+
+        paths = []
+        seen = set()
+
+        def add_path(path):
+            key = tuple(path)
+            if key in seen:
+                return
+            seen.add(key)
+            paths.append(path)
+
+        if objective == "MaxBW":
+            thresholds = sorted(
+                {float(data.get("bw", 0)) for _, _, data in valid_g.edges(data=True)},
+                reverse=True,
+            )
+            for threshold in thresholds:
+                bw_g = nx.DiGraph()
+                for u, v, data in valid_g.edges(data=True):
+                    if float(data.get("bw", 0)) >= threshold:
+                        bw_g.add_edge(u, v, **data)
+                if src not in bw_g or dst not in bw_g or not nx.has_path(bw_g, src, dst):
+                    continue
+                try:
+                    for path in nx.shortest_simple_paths(bw_g, src, dst, weight="delay"):
+                        add_path(path)
+                        if len(paths) >= limit:
+                            return paths
+                except (nx.NetworkXNoPath, nx.NodeNotFound):
+                    continue
+        else:
+            weight = "delay" if objective == "MinDelay" else None
+            try:
+                for path in nx.shortest_simple_paths(valid_g, src, dst, weight=weight):
+                    add_path(path)
+                    if len(paths) >= limit:
+                        break
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                pass
+
+        return paths
+
+    def _baseline_segment_options(
+        self, domain_path, src_c, src_h, dst_c, dst_h, bw_demand, objective, limit=8
+    ):
+        all_options = []
+        for i, curr_domain in enumerate(domain_path):
+            if i == 0:
+                ingress = src_h
+            else:
+                prev = domain_path[i - 1]
+                link = self._find_inter_link(prev, curr_domain)
+                if not link:
+                    return []
+                ingress = self._get_border_switch(curr_domain, link["dst_iface"])
+
+            if i == len(domain_path) - 1:
+                egress, egress_iface = dst_h, None
+            else:
+                next_d = domain_path[i + 1]
+                link = self._find_inter_link(curr_domain, next_d)
+                if not link:
+                    return []
+                egress = self._get_border_switch(curr_domain, link["src_iface"])
+                egress_iface = link["src_iface"]
+
+            if not ingress or not egress:
+                return []
+
+            local_paths = self._local_path_candidates(
+                self.intra_graphs[curr_domain],
+                ingress,
+                egress,
+                bw_demand,
+                objective,
+                limit=limit,
+            )
+            if not local_paths:
+                return []
+
+            all_options.append(
+                [
+                    {
+                        "container": curr_domain,
+                        "path": path,
+                        "score": 0,
+                        "egress_iface": egress_iface,
+                    }
+                    for path in local_paths
+                ]
+            )
+
+        return all_options
+
+    def _segments_to_flat_path(self, segments):
+        flat_path = []
+        for seg in segments:
+            c_name = seg.get("container")
+            for node in seg.get("path", []):
+                item = f"{c_name}:{node}"
+                if not flat_path or flat_path[-1] != item:
+                    flat_path.append(item)
+        return flat_path
+
+    def _objective_key(self, metrics, objective):
+        if objective == "MaxBW":
+            return (
+                -metrics.get("bw", 0),
+                metrics.get("delay", 0),
+                metrics.get("loss", 0),
+                metrics.get("hops", 0),
+            )
+        if objective == "MinHop":
+            return (
+                metrics.get("hops", 0),
+                -metrics.get("bw", 0),
+                metrics.get("delay", 0),
+                metrics.get("loss", 0),
+            )
+        return (
+            metrics.get("delay", 0),
+            -metrics.get("bw", 0),
+            metrics.get("loss", 0),
+            metrics.get("hops", 0),
+        )
+
+    def _calculate_baselines(
+        self,
+        src,
+        dst,
+        bw_demand,
+        max_delay=None,
+        max_loss=None,
+        max_labels_per_node=8,
+        domain_path=None,
+    ):
+        """
+        分层基线：沿用 GNN Rank0 的域间路径，只替换各域内路径选择规则。
+        """
+        src_c, src_h = src.split(":")
+        dst_c, dst_h = dst.split(":")
+        if not domain_path:
+            return {}
+
+        results = {}
+        for objective in ("MaxBW", "MinDelay", "MinHop"):
+            segment_options = self._baseline_segment_options(
+                domain_path,
+                src_c,
+                src_h,
+                dst_c,
+                dst_h,
+                bw_demand,
+                objective,
+                limit=max_labels_per_node,
+            )
+            if not segment_options:
+                continue
+
+            best = None
+            best_key = None
+            for combo in product(*segment_options):
+                segments = list(combo)
+                metrics = self._end_to_end_metrics(segments, domain_path)
+                flat_path = self._segments_to_flat_path(segments)
+                metrics["hops"] = max(0, len(flat_path) - 1)
+                if not self._metrics_satisfy(metrics, bw_demand, max_delay, max_loss):
+                    continue
+                key = self._objective_key(metrics, objective)
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best = {
+                        "path": flat_path,
+                        "metrics": metrics,
+                        "inter_domain_path": list(domain_path),
+                    }
+
+            if best:
+                results[objective] = best
+
+        return results
+
+    def _print_baseline_comparison(self, gnn_best, baseline_results):
+        print("\n>>> QoS Baseline Comparison")
+        print("    Method      BW(Mbps)  Delay(ms)  Loss(%)   Hops")
+        print("    " + "-" * 58)
+
+        rows = []
+        if gnn_best:
+            metrics = dict(gnn_best.get("metrics", {}))
+            metrics["hops"] = max(0, len(self._gnn_path_to_flat(gnn_best)) - 1)
+            rows.append(("GNN-Rank0", metrics, self._gnn_path_to_flat(gnn_best)))
+
+        for name in ("MaxBW", "MinDelay", "MinHop"):
+            item = baseline_results.get(name)
+            if item:
+                rows.append((name, item["metrics"], item["path"]))
+            else:
+                rows.append((name, None, None))
+
+        for name, metrics, path in rows:
+            if not metrics:
+                print(f"    {name:<10} {'Not Found':>34}")
+                continue
+            print(
+                f"    {name:<10} "
+                f"{metrics.get('bw', 0):>8.2f}  "
+                f"{metrics.get('delay', 0):>9.2f}  "
+                f"{metrics.get('loss', 0):>7.3f}  "
+                f"{int(metrics.get('hops', 0)):>5}"
+            )
+            print(f"      Path: {self._path_to_display(path)}")
+
     # ================= 辅助查找 =================
     def _get_border_switch(self, c_name, eth_name):
         g = self.intra_graphs[c_name]
@@ -448,7 +686,16 @@ class RouteCalculator:
             print("[Error] No path found in Augmented Graph!")
             return []
 
-    def calculate_and_save(self, src, dst, bw_demand, max_delay=None, max_loss=None):
+    def calculate_and_save(
+        self,
+        src,
+        dst,
+        bw_demand,
+        max_delay=None,
+        max_loss=None,
+        compare_baselines=False,
+        baseline_max_labels=8,
+    ):
         self.load_data()
         self.build_graphs()
 
@@ -597,6 +844,19 @@ class RouteCalculator:
             print("[Error] No path satisfies requested QoS constraints.")
             return
 
+        baseline_results = {}
+        if compare_baselines:
+            baseline_results = self._calculate_baselines(
+                src,
+                dst,
+                bw_demand,
+                max_delay=max_delay,
+                max_loss=max_loss,
+                max_labels_per_node=baseline_max_labels,
+                domain_path=final_paths[0].get("inter_domain_path"),
+            )
+            self._print_baseline_comparison(final_paths[0], baseline_results)
+
         # 4. 保存到文件
         filename = build_path_filename(src, dst, bw_demand, max_delay, max_loss)
 
@@ -605,6 +865,20 @@ class RouteCalculator:
             json.dump(final_paths, f, indent=4)
 
         print(f"\n>>> Calculation Complete. Paths saved to: {save_path}")
+
+        if compare_baselines:
+            baseline_filename = filename.replace(".json", "_baselines.json")
+            baseline_save_path = os.path.join(PATH_SAVE_DIR, baseline_filename)
+            serializable = {
+                name: {
+                    "path": item["path"],
+                    "metrics": item["metrics"],
+                }
+                for name, item in baseline_results.items()
+            }
+            with open(baseline_save_path, "w") as f:
+                json.dump(serializable, f, indent=4)
+            print(f"    Baseline comparison saved to: {baseline_save_path}")
 
 
 if __name__ == "__main__":
@@ -629,6 +903,17 @@ if __name__ == "__main__":
         default=None,
         help="Optional end-to-end max packet loss in percent",
     )
+    parser.add_argument(
+        "--compare-baselines",
+        action="store_true",
+        help="Also calculate hierarchical MaxBW/MinDelay/MinHop baselines on the GNN Rank0 inter-domain path",
+    )
+    parser.add_argument(
+        "--baseline-max-labels",
+        type=int,
+        default=8,
+        help="Max local candidate paths kept per domain for hierarchical baselines",
+    )
     args = parser.parse_args()
 
     calc = RouteCalculator()
@@ -638,6 +923,8 @@ if __name__ == "__main__":
         args.bw,
         max_delay=args.max_delay,
         max_loss=args.max_loss,
+        compare_baselines=args.compare_baselines,
+        baseline_max_labels=args.baseline_max_labels,
     )
 
     end_time = time.time()

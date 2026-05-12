@@ -165,6 +165,18 @@ sudo python3 route_cal.py docker2:h1 docker5:h1 20 120 5
 sudo python3 route_path.py docker2:h1 docker5:h1 20 120 5 --index 0
 ```
 
+需要做可解释基线对比时，算路阶段增加 `--compare-baselines`：
+```bash
+sudo python3 route_cal.py docker2:h1 docker5:h1 20 120 5 --compare-baselines
+```
+
+该选项会沿用 `GNN-Rank0` 选出的域间路径，只在途经的各个域内改用传统规则重新选局部路径，然后输出满足 QoS 需求的三类分层基线路径：
+- `MaxBW`：瓶颈剩余带宽最大路径。
+- `MinDelay`：端到端时延最小路径。
+- `MinHop`：跳数最少路径。
+
+输出表中会列出 `BW / Delay / Loss / Hops / Path`，用于在相同域间路径条件下和 `GNN-Rank0` 路径做客观对比。
+
 算路结果文件会保存每条候选路径的实际指标：
 ```json
 "metrics": {
